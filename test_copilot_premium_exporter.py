@@ -11,7 +11,7 @@ from prometheus_client import CollectorRegistry
 from copilot_premium_exporter import CopilotPremiumCollector, ExporterConfig
 
 SAMPLE_RESPONSE = {
-    "timePeriod": {"year": 2026},
+    "timePeriod": {"year": 2026, "month": 6},
     "usageItems": [
         {
             "product": "Copilot",
@@ -42,7 +42,7 @@ SAMPLE_RESPONSE = {
     ],
 }
 
-EMPTY_RESPONSE = {"timePeriod": {"year": 2026}, "usageItems": []}
+EMPTY_RESPONSE = {"timePeriod": {"year": 2026, "month": 6}, "usageItems": []}
 
 ENT_URL = (
     "https://api.github.com/enterprises/test-ent"
@@ -148,6 +148,7 @@ class TestCollectWithData:
         assert gpt5[0].labels["name"] == "test-ent"
         assert gpt5[0].labels["year"] == "2026"
         assert gpt5[0].labels["product"] == "Copilot"
+        assert gpt5[0].labels["month"] == "6"
 
     @responses.activate
     def test_discount_values(self) -> None:

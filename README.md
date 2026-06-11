@@ -265,7 +265,7 @@ When using Docker Compose, the dashboard is **auto-provisioned** — no manual i
 
 ### Usage Metrics (Gauges)
 
-Labels on all usage metrics: `type`, `name`, `product`, `sku`, `model`, `unit`, `year`
+Labels on all usage metrics: `type`, `name`, `product`, `sku`, `model`, `unit`, `year`, `month`
 
 | Metric                                              | Description                        |
 |-----------------------------------------------------|------------------------------------|
@@ -288,6 +288,7 @@ Labels on all usage metrics: `type`, `name`, `product`, `sku`, `model`, `unit`, 
 | `model`   | `GPT-5`               | AI model used (the key cost dimension)     |
 | `unit`    | `requests`            | Unit of measurement                        |
 | `year`    | `2026`                | Billing period year                        |
+| `month`   | `6`                   | Billing period month (1-12)                |
 
 ### Operational Metrics
 

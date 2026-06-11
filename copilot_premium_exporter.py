@@ -7,6 +7,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -36,7 +37,7 @@ USAGE_METRICS: dict[str, str] = {
     "github_premium_request_usage_price_per_unit": "pricePerUnit",
 }
 
-LABEL_NAMES = ["type", "name", "product", "sku", "model", "unit", "year"]
+LABEL_NAMES = ["type", "name", "product", "sku", "model", "unit", "year", "month"]
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
@@ -139,7 +140,11 @@ class CopilotPremiumCollector:
         return session
 
     def _fetch(self) -> dict[str, Any] | None:
-        """Fetch billing data for the configured enterprise, using cache."""
+        """Fetch billing data for the configured enterprise, using cache.
+
+        Passes year and month query parameters so the API returns data for the
+        current billing period rather than an empty response.
+        """
         now = time.monotonic()
 
         with self._cache_lock:
@@ -147,12 +152,14 @@ class CopilotPremiumCollector:
                 logger.debug("Cache hit for enterprise/%s", self._config.enterprise)
                 return self._cache.data
 
+        utc_now = datetime.now(timezone.utc)
         url = (
             f"https://api.github.com/enterprises/{self._config.enterprise}"
             f"/settings/billing/premium_request/usage"
         )
+        params = {"year": utc_now.year, "month": utc_now.month}
         try:
-            resp = self._session.get(url, timeout=self._config.http_timeout)
+            resp = self._session.get(url, params=params, timeout=self._config.http_timeout)
         except requests.RequestException as exc:
             logger.error(
                 "HTTP error fetching enterprise/%s: %s", self._config.enterprise, exc
@@ -222,7 +229,9 @@ class CopilotPremiumCollector:
             )
 
         if data:
-            year = str(data.get("timePeriod", {}).get("year", ""))
+            time_period = data.get("timePeriod", {})
+            year = str(time_period.get("year", ""))
+            month = str(time_period.get("month", datetime.now(timezone.utc).month))
             for item in data.get("usageItems", []):
                 label_values = [
                     "enterprise",
@@ -232,6 +241,7 @@ class CopilotPremiumCollector:
                     item.get("model", ""),
                     item.get("unitType", ""),
                     year,
+                    month,
                 ]
                 for metric_name, json_key in USAGE_METRICS.items():
                     value = item.get(json_key, 0)
