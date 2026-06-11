@@ -1,4 +1,4 @@
-"""Prometheus exporter for GitHub Copilot Premium Request usage (Enhanced Billing Platform)."""
+"""Prometheus exporter for GitHub Copilot AI Credits / Premium Request usage."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Iterable
 
 import requests
 from prometheus_client import (
@@ -26,7 +26,6 @@ from urllib3.util.retry import Retry
 
 logger = logging.getLogger("copilot_premium_exporter")
 
-# Metric names and their JSON keys in usageItems
 USAGE_METRICS: dict[str, str] = {
     "github_premium_request_usage_gross_quantity": "grossQuantity",
     "github_premium_request_usage_net_quantity": "netQuantity",
@@ -37,8 +36,17 @@ USAGE_METRICS: dict[str, str] = {
     "github_premium_request_usage_price_per_unit": "pricePerUnit",
 }
 
-LABEL_NAMES = ["type", "name", "product", "sku", "model", "unit", "year", "month"]
+# Fallback endpoint (general /settings/billing/usage) uses different keys.
+GENERAL_USAGE_FIELD_MAP: dict[str, str] = {
+    "github_premium_request_usage_gross_quantity": "quantity",
+    "github_premium_request_usage_net_quantity": "quantity",
+    "github_premium_request_usage_gross_amount": "grossAmount",
+    "github_premium_request_usage_net_amount": "netAmount",
+    "github_premium_request_usage_discount_amount": "discountAmount",
+    "github_premium_request_usage_price_per_unit": "pricePerUnit",
+}
 
+LABEL_NAMES = ["type", "name", "product", "sku", "model", "unit", "year", "month"]
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
 
@@ -47,17 +55,18 @@ class ExporterConfig:
     """Configuration loaded from config.json + GITHUB_TOKEN env var."""
 
     token: str
-    enterprise: str
+    enterprise: str = ""
+    organization: str = ""
     cache_ttl: int = 900
     http_timeout: int = 30
     port: int = 9185
     host: str = "0.0.0.0"
     log_level: str = "INFO"
     api_version: str = "2022-11-28"
+    api_base: str = "https://api.github.com"
 
     @classmethod
     def load(cls, config_path: Path = CONFIG_PATH) -> ExporterConfig:
-        """Load config from config.json. Token comes from GITHUB_TOKEN env var."""
         token = os.environ.get("GITHUB_TOKEN", "")
         if not token:
             logger.critical("GITHUB_TOKEN environment variable is required")
@@ -69,39 +78,52 @@ class ExporterConfig:
             logger.critical("Failed to read %s: %s", config_path, exc)
             raise SystemExit(1) from exc
 
-        enterprise = raw.get("github_enterprise", "")
-        if not enterprise:
-            logger.critical("github_enterprise is required in config.json")
+        enterprise = raw.get("github_enterprise", "").strip()
+        organization = raw.get("github_organization", "").strip()
+        if not enterprise and not organization:
+            logger.critical(
+                "Set either github_enterprise or github_organization in config.json"
+            )
             raise SystemExit(1)
 
         return cls(
             token=token,
             enterprise=enterprise,
+            organization=organization,
             cache_ttl=raw.get("cache_ttl_seconds", 900),
             http_timeout=raw.get("http_timeout_seconds", 30),
             port=raw.get("exporter_port", 9185),
             host=raw.get("exporter_host", "0.0.0.0"),
             log_level=raw.get("log_level", "INFO"),
             api_version=raw.get("api_version", "2022-11-28"),
+            api_base=raw.get("api_base", "https://api.github.com").rstrip("/"),
         )
+
+    @property
+    def entity_type(self) -> str:
+        return "enterprise" if self.enterprise else "organization"
+
+    @property
+    def entity_name(self) -> str:
+        return self.enterprise or self.organization
 
 
 @dataclass
 class CacheEntry:
-    """Cached API response with expiry."""
-
-    data: dict[str, Any]
+    items: list[dict[str, Any]]
+    year: str
+    month: str
     expires_at: float
 
 
 class CopilotPremiumCollector:
-    """Custom Prometheus collector for GitHub Copilot premium request billing data.
+    """Custom Prometheus collector for GitHub Copilot billing data."""
 
-    Rebuilds the full label set every scrape so stale series disappear when a model
-    drops out. API responses are cached for `config.cache_ttl` seconds.
-    """
-
-    def __init__(self, config: ExporterConfig, registry: CollectorRegistry | None = REGISTRY):
+    def __init__(
+        self,
+        config: ExporterConfig,
+        registry: CollectorRegistry | None = REGISTRY,
+    ):
         self._config = config
         self._session = self._build_session()
         self._cache: CacheEntry | None = None
@@ -117,17 +139,19 @@ class CopilotPremiumCollector:
             "Total number of failed scrapes",
             registry=registry,
         )
+
         if registry is not None:
             registry.register(self)
 
     def _build_session(self) -> requests.Session:
-        """Create an HTTP session with retry logic for transient 5xx errors."""
         session = requests.Session()
         session.headers.update(
             {
-                "Accept": "application/json",
+                # Fix: GitHub's documented Accept header is vnd.github+json.
+                "Accept": "application/vnd.github+json",
                 "Authorization": f"Bearer {self._config.token}",
                 "X-GitHub-Api-Version": self._config.api_version,
+                "User-Agent": "copilot-premium-exporter/1.0",
             }
         )
         retry = Retry(
@@ -139,151 +163,172 @@ class CopilotPremiumCollector:
         session.mount("https://", HTTPAdapter(max_retries=retry))
         return session
 
-    def _fetch(self) -> dict[str, Any] | None:
-        """Fetch billing data for the configured enterprise, using cache.
+    def _endpoint(self, kind: str) -> str:
+        """Build the API URL. kind is 'premium_request' or 'general'."""
+        base = self._config.api_base
+        scope = "enterprises" if self._config.entity_type == "enterprise" else "organizations"
+        name = self._config.entity_name
+        if kind == "premium_request":
+            return f"{base}/{scope}/{name}/settings/billing/premium_request/usage"
+        return f"{base}/{scope}/{name}/settings/billing/usage"
 
-        Passes year and month query parameters so the API returns data for the
-        current billing period rather than an empty response.
+    def _get(self, url: str) -> dict[str, Any] | None:
+        """GET a URL; return parsed JSON on 200, None on any failure.
+
+        No query params — the endpoint is undocumented for year/month and
+        passing them empirically causes empty responses.
         """
-        now = time.monotonic()
-
-        with self._cache_lock:
-            if self._cache and self._cache.expires_at > now:
-                logger.debug("Cache hit for enterprise/%s", self._config.enterprise)
-                return self._cache.data
-
-        utc_now = datetime.now(timezone.utc)
-        url = (
-            f"https://api.github.com/enterprises/{self._config.enterprise}"
-            f"/settings/billing/premium_request/usage"
-        )
-        params = {"year": utc_now.year, "month": utc_now.month}
         try:
-            resp = self._session.get(url, params=params, timeout=self._config.http_timeout)
+            resp = self._session.get(url, timeout=self._config.http_timeout)
         except requests.RequestException as exc:
-            logger.error(
-                "HTTP error fetching enterprise/%s: %s", self._config.enterprise, exc
-            )
+            logger.error("HTTP error on %s: %s", url, exc)
             self._scrape_failures.inc()
             return None
 
         if resp.status_code == 200:
-            data = resp.json()
-            with self._cache_lock:
-                self._cache = CacheEntry(
-                    data=data, expires_at=time.monotonic() + self._config.cache_ttl
-                )
-            return data
+            return resp.json()
 
         self._scrape_failures.inc()
-
+        body = resp.text[:300]
         if resp.status_code in (401, 403):
             logger.error(
-                "Auth failed for enterprise/%s (HTTP %d). "
-                "Classic PAT needs admin:enterprise scope. "
-                "Fine-grained token needs Billing: read permission.",
-                self._config.enterprise,
-                resp.status_code,
+                "Auth failed (%d) for %s — token needs "
+                "manage_billing:enterprise (classic) or Billing:Read (fine-grained). Body: %s",
+                resp.status_code, url, body,
             )
         elif resp.status_code == 404:
             logger.error(
-                "enterprise/%s returned 404 — it may not be on the Enhanced Billing Platform.",
-                self._config.enterprise,
+                "404 for %s — wrong scope (org vs enterprise slug) or "
+                "entity not on Enhanced Billing Platform. Body: %s",
+                url, body,
             )
         elif resp.status_code == 429 or resp.headers.get("X-RateLimit-Remaining") == "0":
-            reset_at = resp.headers.get("X-RateLimit-Reset", "unknown")
             logger.warning(
-                "Rate limited for enterprise/%s. Resets at epoch %s. "
-                "Will serve cached data until cache TTL expires.",
-                self._config.enterprise,
-                reset_at,
+                "Rate limited; resets at %s. Serving cached data.",
+                resp.headers.get("X-RateLimit-Reset", "unknown"),
             )
         else:
-            logger.error(
-                "Unexpected HTTP %d for enterprise/%s: %s",
-                resp.status_code,
-                self._config.enterprise,
-                resp.text[:200],
-            )
+            logger.error("HTTP %d for %s: %s", resp.status_code, url, body)
         return None
 
-    def describe(self) -> list[GaugeMetricFamily]:
-        """Return empty metric families for registration — avoids a collect() call at startup."""
-        return [GaugeMetricFamily(name, "", labels=LABEL_NAMES) for name in USAGE_METRICS]
+    def _fetch(self) -> CacheEntry | None:
+        """Return cached or freshly-fetched usage. Tries premium_request first,
+        falls back to general /settings/billing/usage if that returns nothing.
+        Post-June-2026 AI Credits data may live in either endpoint depending
+        on plan migration state.
+        """
+        now = time.monotonic()
+        with self._cache_lock:
+            if self._cache and self._cache.expires_at > now:
+                return self._cache
 
-    def collect(self):
-        """Yield Prometheus metric families from cached GitHub billing data."""
-        start = time.monotonic()
-        data = self._fetch()
-        duration = time.monotonic() - start
+        utc_now = datetime.now(timezone.utc)
+        default_year = str(utc_now.year)
+        default_month = str(utc_now.month)
 
-        self._scrape_duration.observe(duration)
+        items: list[dict[str, Any]] = []
+        year, month = default_year, default_month
 
-        # Build gauge families — fresh on every scrape, so stale series disappear.
-        families: dict[str, GaugeMetricFamily] = {}
-        for metric_name in USAGE_METRICS:
-            families[metric_name] = GaugeMetricFamily(
-                metric_name,
-                f"Copilot premium request {USAGE_METRICS[metric_name]}",
-                labels=LABEL_NAMES,
+        # Primary: premium_request endpoint (has the `model` field).
+        data = self._get(self._endpoint("premium_request"))
+        if data:
+            tp = data.get("timePeriod", {}) or {}
+            year = str(tp.get("year", default_year))
+            month = str(tp.get("month", default_month))
+            items = data.get("usageItems", []) or []
+            logger.info(
+                "premium_request endpoint returned %d items for %s/%s",
+                len(items), self._config.entity_type, self._config.entity_name,
             )
 
-        if data:
-            time_period = data.get("timePeriod", {})
-            year = str(time_period.get("year", ""))
-            month = str(time_period.get("month", datetime.now(timezone.utc).month))
-            for item in data.get("usageItems", []):
+        # Fallback: general usage endpoint (no `model` field, but at least gets Copilot SKU spend).
+        if not items:
+            logger.info("Falling back to general /settings/billing/usage endpoint")
+            data = self._get(self._endpoint("general"))
+            if data:
+                all_items = data.get("usageItems", []) or []
+                items = [
+                    {**i, "model": ""}  # general endpoint has no model field
+                    for i in all_items
+                    if (i.get("product") or "").lower() == "copilot"
+                ]
+                logger.info("general endpoint returned %d Copilot items", len(items))
+
+        if data is None and not items:
+            return None  # complete failure — don't poison the cache
+
+        entry = CacheEntry(
+            items=items,
+            year=year,
+            month=month,
+            expires_at=time.monotonic() + self._config.cache_ttl,
+        )
+        with self._cache_lock:
+            self._cache = entry
+        return entry
+
+    def collect(self) -> Iterable[GaugeMetricFamily]:
+        start = time.monotonic()
+        entry = self._fetch()
+        self._scrape_duration.observe(time.monotonic() - start)
+
+        families = {
+            name: GaugeMetricFamily(name, USAGE_METRICS[name], labels=LABEL_NAMES)
+            for name in USAGE_METRICS
+        }
+
+        if entry is not None:
+            for item in entry.items:
+                # Premium-request schema has separate gross/net quantities;
+                # general schema has only "quantity". Use a per-metric fallback.
                 label_values = [
-                    "enterprise",
-                    self._config.enterprise,
-                    item.get("product", ""),
-                    item.get("sku", ""),
-                    item.get("model", ""),
-                    item.get("unitType", ""),
-                    year,
-                    month,
+                    self._config.entity_type,
+                    self._config.entity_name,
+                    str(item.get("product", "")),
+                    str(item.get("sku", "")),
+                    str(item.get("model", "")),
+                    str(item.get("unitType", "")),
+                    entry.year,
+                    entry.month,
                 ]
                 for metric_name, json_key in USAGE_METRICS.items():
-                    value = item.get(json_key, 0)
-                    families[metric_name].add_metric(label_values, float(value))
+                    value = item.get(json_key)
+                    if value is None:
+                        # General endpoint fallback for missing keys.
+                        fallback_key = GENERAL_USAGE_FIELD_MAP.get(metric_name)
+                        value = item.get(fallback_key, 0) if fallback_key else 0
+                    families[metric_name].add_metric(label_values, float(value or 0))
 
         yield from families.values()
 
         success = GaugeMetricFamily(
             "github_premium_request_scrape_success",
-            "Whether the last scrape succeeded (1) or failed (0)",
+            "1 if last scrape succeeded and returned any items, else 0",
         )
-        success.add_metric([], 1.0 if data is not None else 0.0)
+        success.add_metric([], 1.0 if entry and entry.items else 0.0)
         yield success
 
-        last_scrape = GaugeMetricFamily(
+        last = GaugeMetricFamily(
             "github_premium_request_last_scrape_timestamp_seconds",
-            "Unix timestamp of the last scrape",
+            "Unix timestamp of the last scrape attempt",
         )
-        last_scrape.add_metric([], time.time())
-        yield last_scrape
+        last.add_metric([], time.time())
+        yield last
 
 
 def main() -> None:
-    """Entry point: load config.json, register collector, start HTTP server."""
     config = ExporterConfig.load()
     logging.basicConfig(
         level=getattr(logging, config.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-
     logger.info(
-        "Starting exporter on %s:%d (enterprise=%s, cache_ttl=%ds)",
-        config.host,
-        config.port,
-        config.enterprise,
-        config.cache_ttl,
+        "Starting exporter on %s:%d (%s=%s, cache_ttl=%ds)",
+        config.host, config.port, config.entity_type, config.entity_name, config.cache_ttl,
     )
-
     CopilotPremiumCollector(config)
     start_http_server(config.port, addr=config.host)
-    logger.info("Exporter ready")
-
+    logger.info("Exporter ready — metrics on /metrics")
     try:
         while True:
             time.sleep(3600)
