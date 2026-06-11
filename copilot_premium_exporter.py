@@ -46,7 +46,7 @@ class ExporterConfig:
     """Configuration loaded from config.json + GITHUB_TOKEN env var."""
 
     token: str
-    org: str
+    enterprise: str
     cache_ttl: int = 900
     http_timeout: int = 30
     port: int = 9185
@@ -68,14 +68,14 @@ class ExporterConfig:
             logger.critical("Failed to read %s: %s", config_path, exc)
             raise SystemExit(1) from exc
 
-        org = raw.get("github_org", "")
-        if not org:
-            logger.critical("github_org is required in config.json")
+        enterprise = raw.get("github_enterprise", "")
+        if not enterprise:
+            logger.critical("github_enterprise is required in config.json")
             raise SystemExit(1)
 
         return cls(
             token=token,
-            org=org,
+            enterprise=enterprise,
             cache_ttl=raw.get("cache_ttl_seconds", 900),
             http_timeout=raw.get("http_timeout_seconds", 30),
             port=raw.get("exporter_port", 9185),
@@ -139,22 +139,24 @@ class CopilotPremiumCollector:
         return session
 
     def _fetch(self) -> dict[str, Any] | None:
-        """Fetch billing data for the configured org, using cache."""
+        """Fetch billing data for the configured enterprise, using cache."""
         now = time.monotonic()
 
         with self._cache_lock:
             if self._cache and self._cache.expires_at > now:
-                logger.debug("Cache hit for org/%s", self._config.org)
+                logger.debug("Cache hit for enterprise/%s", self._config.enterprise)
                 return self._cache.data
 
         url = (
-            f"https://api.github.com/organizations/{self._config.org}"
+            f"https://api.github.com/enterprises/{self._config.enterprise}"
             f"/settings/billing/premium_request/usage"
         )
         try:
             resp = self._session.get(url, timeout=self._config.http_timeout)
         except requests.RequestException as exc:
-            logger.error("HTTP error fetching org/%s: %s", self._config.org, exc)
+            logger.error(
+                "HTTP error fetching enterprise/%s: %s", self._config.enterprise, exc
+            )
             self._scrape_failures.inc()
             return None
 
@@ -170,30 +172,30 @@ class CopilotPremiumCollector:
 
         if resp.status_code in (401, 403):
             logger.error(
-                "Auth failed for org/%s (HTTP %d). "
-                "Classic PAT needs read:org or admin:org scope. "
-                "Fine-grained token needs Administration: read permission.",
-                self._config.org,
+                "Auth failed for enterprise/%s (HTTP %d). "
+                "Classic PAT needs admin:enterprise scope. "
+                "Fine-grained token needs Billing: read permission.",
+                self._config.enterprise,
                 resp.status_code,
             )
         elif resp.status_code == 404:
             logger.error(
-                "org/%s returned 404 — it may not be on the Enhanced Billing Platform.",
-                self._config.org,
+                "enterprise/%s returned 404 — it may not be on the Enhanced Billing Platform.",
+                self._config.enterprise,
             )
         elif resp.status_code == 429 or resp.headers.get("X-RateLimit-Remaining") == "0":
             reset_at = resp.headers.get("X-RateLimit-Reset", "unknown")
             logger.warning(
-                "Rate limited for org/%s. Resets at epoch %s. "
+                "Rate limited for enterprise/%s. Resets at epoch %s. "
                 "Will serve cached data until cache TTL expires.",
-                self._config.org,
+                self._config.enterprise,
                 reset_at,
             )
         else:
             logger.error(
-                "Unexpected HTTP %d for org/%s: %s",
+                "Unexpected HTTP %d for enterprise/%s: %s",
                 resp.status_code,
-                self._config.org,
+                self._config.enterprise,
                 resp.text[:200],
             )
         return None
@@ -223,8 +225,8 @@ class CopilotPremiumCollector:
             year = str(data.get("timePeriod", {}).get("year", ""))
             for item in data.get("usageItems", []):
                 label_values = [
-                    "org",
-                    self._config.org,
+                    "enterprise",
+                    self._config.enterprise,
                     item.get("product", ""),
                     item.get("sku", ""),
                     item.get("model", ""),
@@ -261,10 +263,10 @@ def main() -> None:
     )
 
     logger.info(
-        "Starting exporter on %s:%d (org=%s, cache_ttl=%ds)",
+        "Starting exporter on %s:%d (enterprise=%s, cache_ttl=%ds)",
         config.host,
         config.port,
-        config.org,
+        config.enterprise,
         config.cache_ttl,
     )
 

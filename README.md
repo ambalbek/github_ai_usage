@@ -63,28 +63,30 @@ You need a token that can read billing data. Choose one:
 
 1. Go to https://github.com/settings/tokens
 2. Click **Generate new token (classic)**
-3. Select scope: **`read:org`** (or `admin:org`)
+3. Select scope: **`manage_billing:copilot`** and **`read:enterprise`**
 4. Click **Generate token**
 5. Copy the token (starts with `ghp_`)
 
-### Option B: Fine-Grained Personal Access Token
+### Option B: Fine-Grained Personal Access Token (recommended)
 
 1. Go to https://github.com/settings/tokens?type=beta
 2. Click **Generate new token**
-3. Set **Resource owner** to your organization
-4. Under **Organization permissions**, set **Administration** to **Read**
+3. Set **Resource owner** to your enterprise
+4. Under **Organization permissions**, set **Billing** to **Read**
 5. Click **Generate token**
 6. Copy the token (starts with `github_pat_`)
+
+> **Note**: Fine-grained tokens are recommended because they follow the principle of least privilege.
 
 ---
 
 ## Step 2 — Configure the Exporter
 
-Edit `config.json` and replace `my-org` with your GitHub organization login:
+Edit `config.json` and replace `my-enterprise` with your GitHub Enterprise slug:
 
 ```json
 {
-    "github_org": "my-org",
+    "github_enterprise": "my-enterprise",
     "api_version": "2022-11-28",
     "cache_ttl_seconds": 900,
     "http_timeout_seconds": 30,
@@ -93,6 +95,8 @@ Edit `config.json` and replace `my-org` with your GitHub organization login:
     "log_level": "INFO"
 }
 ```
+
+> Your enterprise slug is the part after `github.com/enterprises/` in your enterprise URL.
 
 Set your token as an environment variable (never put it in config.json):
 
@@ -241,7 +245,7 @@ When using Docker Compose, the dashboard is **auto-provisioned** — no manual i
 
 | Key                    | Required | Default      | Description                                           |
 |------------------------|----------|--------------|-------------------------------------------------------|
-| `github_org`           | Yes      | —            | Your GitHub organization login (e.g., `"my-org"`)     |
+| `github_enterprise`    | Yes      | —            | Your GitHub Enterprise slug (e.g., `"my-enterprise"`) |
 | `api_version`          | No       | `2022-11-28` | GitHub API version header                             |
 | `cache_ttl_seconds`    | No       | `900`        | Seconds to cache API responses (15 min default)       |
 | `http_timeout_seconds` | No       | `30`         | HTTP request timeout in seconds                       |
@@ -277,8 +281,8 @@ Labels on all usage metrics: `type`, `name`, `product`, `sku`, `model`, `unit`, 
 
 | Label     | Example               | Description                                |
 |-----------|-----------------------|--------------------------------------------|
-| `type`    | `org`                 | Always `org` (organization)                |
-| `name`    | `my-org`              | Organization login from config.json        |
+| `type`    | `enterprise`          | Always `enterprise`                        |
+| `name`    | `my-enterprise`       | Enterprise slug from config.json           |
 | `product` | `Copilot`             | GitHub product name                        |
 | `sku`     | `Copilot Premium Request` | Billing SKU                            |
 | `model`   | `GPT-5`               | AI model used (the key cost dimension)     |
@@ -334,16 +338,16 @@ min_over_time(github_premium_request_scrape_success[1h])
 
 ### Exporter starts but metrics show no usage data
 
-- **Cause**: Your org may not be on the Enhanced Billing Platform, or there's no Copilot premium usage yet.
+- **Cause**: Your enterprise may not be on the Enhanced Billing Platform, or there's no Copilot premium usage yet.
 - **Check**: Look at exporter logs for 404 errors.
-- **Fix**: Confirm your org is enrolled at https://github.com/organizations/YOUR-ORG/settings/billing
+- **Fix**: Confirm your enterprise is enrolled at https://github.com/enterprises/YOUR-ENTERPRISE/settings/billing
 
 ### `scrape_success` is 0
 
 - **Cause**: API call failed. Check exporter logs for details.
 - Common reasons:
-  - **401/403**: Token lacks required scope. Classic PAT needs `read:org`. Fine-grained needs `Administration: read`.
-  - **404**: Org not on Enhanced Billing Platform.
+  - **401/403**: Token lacks required scope. Classic PAT needs `manage_billing:copilot` + `read:enterprise`. Fine-grained needs `Billing: read`.
+  - **404**: Enterprise not on Enhanced Billing Platform.
   - **429**: Rate limited. The exporter will serve cached data and retry after the cache TTL expires.
 
 ### Grafana shows "No data"
@@ -356,7 +360,7 @@ min_over_time(github_premium_request_scrape_success[1h])
 
 - `GITHUB_TOKEN environment variable is required` → Set the env var before running.
 - `Failed to read config.json` → Make sure `config.json` exists in the same directory as the script.
-- `github_org is required in config.json` → Edit `config.json` and set your org name.
+- `github_enterprise is required in config.json` → Edit `config.json` and set your enterprise slug.
 
 ---
 

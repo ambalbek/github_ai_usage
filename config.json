@@ -1,5 +1,5 @@
 {
-    "github_org": "my-org",
+    "github_enterprise": "my-enterprise",
     "api_version": "2022-11-28",
     "cache_ttl_seconds": 900,
     "http_timeout_seconds": 30,

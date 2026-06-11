@@ -12,7 +12,6 @@ from copilot_premium_exporter import CopilotPremiumCollector, ExporterConfig
 
 SAMPLE_RESPONSE = {
     "timePeriod": {"year": 2026},
-    "organization": "test-org",
     "usageItems": [
         {
             "product": "Copilot",
@@ -43,16 +42,16 @@ SAMPLE_RESPONSE = {
     ],
 }
 
-EMPTY_RESPONSE = {"timePeriod": {"year": 2026}, "organization": "test-org", "usageItems": []}
+EMPTY_RESPONSE = {"timePeriod": {"year": 2026}, "usageItems": []}
 
-ORG_URL = (
-    "https://api.github.com/organizations/test-org"
+ENT_URL = (
+    "https://api.github.com/enterprises/test-ent"
     "/settings/billing/premium_request/usage"
 )
 
 
 def _config(**overrides: object) -> ExporterConfig:
-    defaults = dict(token="test-token", org="test-org", cache_ttl=900, http_timeout=5)
+    defaults = dict(token="test-token", enterprise="test-ent", cache_ttl=900, http_timeout=5)
     defaults.update(overrides)
     return ExporterConfig(**defaults)  # type: ignore[arg-type]
 
@@ -71,7 +70,7 @@ class TestConstructor:
         registry = CollectorRegistry()
         collector = CopilotPremiumCollector(config, registry=registry)
         assert collector._config.token == "test-token"
-        assert collector._config.org == "test-org"
+        assert collector._config.enterprise == "test-ent"
         assert collector._config.cache_ttl == 900
 
     def test_session_has_auth_header(self) -> None:
@@ -79,7 +78,9 @@ class TestConstructor:
         assert "Bearer test-token" in collector._session.headers["Authorization"]
 
     def test_session_has_api_version(self) -> None:
-        collector = CopilotPremiumCollector(_config(api_version="2024-01-01"), registry=CollectorRegistry())
+        collector = CopilotPremiumCollector(
+            _config(api_version="2024-01-01"), registry=CollectorRegistry()
+        )
         assert collector._session.headers["X-GitHub-Api-Version"] == "2024-01-01"
 
 
@@ -87,18 +88,18 @@ class TestLoadConfig:
     def test_loads_from_json(self, tmp_path: Path, monkeypatch) -> None:
         cfg_file = tmp_path / "config.json"
         cfg_file.write_text(json.dumps({
-            "github_org": "loaded-org",
+            "github_enterprise": "loaded-ent",
             "cache_ttl_seconds": 600,
             "log_level": "DEBUG",
         }))
         monkeypatch.setenv("GITHUB_TOKEN", "tok-123")
         config = ExporterConfig.load(config_path=cfg_file)
-        assert config.org == "loaded-org"
+        assert config.enterprise == "loaded-ent"
         assert config.cache_ttl == 600
         assert config.log_level == "DEBUG"
         assert config.token == "tok-123"
 
-    def test_missing_org_exits(self, tmp_path: Path, monkeypatch) -> None:
+    def test_missing_enterprise_exits(self, tmp_path: Path, monkeypatch) -> None:
         cfg_file = tmp_path / "config.json"
         cfg_file.write_text(json.dumps({}))
         monkeypatch.setenv("GITHUB_TOKEN", "tok")
@@ -110,7 +111,7 @@ class TestLoadConfig:
 
     def test_missing_token_exits(self, tmp_path: Path, monkeypatch) -> None:
         cfg_file = tmp_path / "config.json"
-        cfg_file.write_text(json.dumps({"github_org": "org"}))
+        cfg_file.write_text(json.dumps({"github_enterprise": "ent"}))
         monkeypatch.delenv("GITHUB_TOKEN", raising=False)
         try:
             ExporterConfig.load(config_path=cfg_file)
@@ -122,7 +123,7 @@ class TestLoadConfig:
 class TestCollectWithData:
     @responses.activate
     def test_yields_expected_families(self) -> None:
-        responses.get(ORG_URL, json=SAMPLE_RESPONSE, status=200)
+        responses.get(ENT_URL, json=SAMPLE_RESPONSE, status=200)
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         metrics = _collect_as_dict(collector)
 
@@ -133,7 +134,7 @@ class TestCollectWithData:
 
     @responses.activate
     def test_correct_label_values(self) -> None:
-        responses.get(ORG_URL, json=SAMPLE_RESPONSE, status=200)
+        responses.get(ENT_URL, json=SAMPLE_RESPONSE, status=200)
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         metrics = _collect_as_dict(collector)
 
@@ -143,14 +144,14 @@ class TestCollectWithData:
         gpt5 = [s for s in gross_qty_samples if s.labels["model"] == "GPT-5"]
         assert len(gpt5) == 1
         assert gpt5[0].value == 100.0
-        assert gpt5[0].labels["type"] == "org"
-        assert gpt5[0].labels["name"] == "test-org"
+        assert gpt5[0].labels["type"] == "enterprise"
+        assert gpt5[0].labels["name"] == "test-ent"
         assert gpt5[0].labels["year"] == "2026"
         assert gpt5[0].labels["product"] == "Copilot"
 
     @responses.activate
     def test_discount_values(self) -> None:
-        responses.get(ORG_URL, json=SAMPLE_RESPONSE, status=200)
+        responses.get(ENT_URL, json=SAMPLE_RESPONSE, status=200)
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         metrics = _collect_as_dict(collector)
 
@@ -161,7 +162,7 @@ class TestCollectWithData:
 
     @responses.activate
     def test_scrape_success_is_one(self) -> None:
-        responses.get(ORG_URL, json=SAMPLE_RESPONSE, status=200)
+        responses.get(ENT_URL, json=SAMPLE_RESPONSE, status=200)
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         metrics = _collect_as_dict(collector)
         assert metrics["github_premium_request_scrape_success"][0].value == 1.0
@@ -170,7 +171,7 @@ class TestCollectWithData:
 class TestCacheTTL:
     @responses.activate
     def test_two_scrapes_within_ttl_make_one_http_call(self) -> None:
-        responses.get(ORG_URL, json=SAMPLE_RESPONSE, status=200)
+        responses.get(ENT_URL, json=SAMPLE_RESPONSE, status=200)
         collector = CopilotPremiumCollector(_config(cache_ttl=600), registry=CollectorRegistry())
 
         list(collector.collect())
@@ -181,7 +182,7 @@ class TestCacheTTL:
 
     @responses.activate
     def test_scrape_after_ttl_expires_makes_new_call(self) -> None:
-        responses.get(ORG_URL, json=SAMPLE_RESPONSE, status=200)
+        responses.get(ENT_URL, json=SAMPLE_RESPONSE, status=200)
         collector = CopilotPremiumCollector(_config(cache_ttl=0), registry=CollectorRegistry())
 
         list(collector.collect())
@@ -194,7 +195,7 @@ class TestCacheTTL:
 class TestEmptyUsageItems:
     @responses.activate
     def test_empty_items_yields_no_per_model_series(self) -> None:
-        responses.get(ORG_URL, json=EMPTY_RESPONSE, status=200)
+        responses.get(ENT_URL, json=EMPTY_RESPONSE, status=200)
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         metrics = _collect_as_dict(collector)
 
@@ -205,7 +206,7 @@ class TestEmptyUsageItems:
 class TestAuthFailure:
     @responses.activate
     def test_401_sets_scrape_success_to_zero(self) -> None:
-        responses.get(ORG_URL, json={"message": "Bad credentials"}, status=401)
+        responses.get(ENT_URL, json={"message": "Bad credentials"}, status=401)
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         metrics = _collect_as_dict(collector)
         assert metrics["github_premium_request_scrape_success"][0].value == 0.0
@@ -213,7 +214,7 @@ class TestAuthFailure:
     @responses.activate
     def test_401_increments_failure_counter(self) -> None:
         registry = CollectorRegistry()
-        responses.get(ORG_URL, json={"message": "Bad credentials"}, status=401)
+        responses.get(ENT_URL, json={"message": "Bad credentials"}, status=401)
         collector = CopilotPremiumCollector(_config(), registry=registry)
         list(collector.collect())
 
@@ -222,7 +223,7 @@ class TestAuthFailure:
 
     @responses.activate
     def test_403_also_fails(self) -> None:
-        responses.get(ORG_URL, json={"message": "Forbidden"}, status=403)
+        responses.get(ENT_URL, json={"message": "Forbidden"}, status=403)
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         metrics = _collect_as_dict(collector)
         assert metrics["github_premium_request_scrape_success"][0].value == 0.0
@@ -231,7 +232,7 @@ class TestAuthFailure:
 class TestNotFound:
     @responses.activate
     def test_404_does_not_crash(self) -> None:
-        responses.get(ORG_URL, json={"message": "Not Found"}, status=404)
+        responses.get(ENT_URL, json={"message": "Not Found"}, status=404)
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         metrics = _collect_as_dict(collector)
 
