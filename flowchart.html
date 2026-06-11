@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Copilot Premium Exporter — Backend Flow</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #0f172a;
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            padding: 40px 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        h1 { color: #f1f5f9; font-size: 28px; margin-bottom: 6px; }
+        .subtitle { color: #94a3b8; font-size: 14px; margin-bottom: 32px; }
+        .chart-container {
+            background: #ffffff;
+            border-radius: 16px;
+            padding: 40px 50px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+        }
+        .mermaid { min-width: 700px; }
+    </style>
+</head>
+<body>
+    <h1>Copilot Premium Exporter</h1>
+    <p class="subtitle">Backend Architecture Flow</p>
+
+    <div class="chart-container">
+        <div class="mermaid">
+flowchart TD
+    PROM(["<b>PROMETHEUS</b><br/>Scrapes :9185/metrics every 60s"]):::blue
+    PROM -->|"HTTP GET /metrics"| COLLECT
+
+    COLLECT["<b>collect()</b> called on<br/>CopilotPremiumCollector"]:::grey
+    COLLECT --> CACHE
+
+    CACHE{"Is cache fresh?<br/><i>TTL = 900s default</i>"}:::yellow
+    CACHE -- "Yes" --> BUILD
+    CACHE -- "No" --> FETCH
+
+    FETCH["<b>ThreadPoolExecutor</b><br/>Concurrent fetch for each<br/>org and enterprise"]:::grey
+
+    FETCH --> API
+
+    subgraph API ["GitHub Billing API"]
+        direction LR
+        EP1["GET /organizations/{org}/<br/>settings/billing/<br/>premium_request/usage"]:::purple
+        EP2["GET /enterprises/{ent}/<br/>settings/billing/<br/>premium_request/usage"]:::purple
+    end
+
+    API --> STATUS
+
+    STATUS{"HTTP Status"}:::yellow
+
+    STATUS -- "200 OK" --> PARSE["Parse JSON<br/>Store in cache with TTL"]:::green
+    STATUS -- "401 / 403" --> ERR_AUTH["Log: token needs<br/><b>read:org</b> or <b>Administration:read</b>"]:::red
+    STATUS -- "404" --> ERR_404["Log: not on<br/>Enhanced Billing Platform"]:::red
+    STATUS -- "429" --> ERR_RATE["Log: rate limited<br/>Back off until reset"]:::orange
+    STATUS -- "5xx" --> RETRY["Retry with backoff<br/>max 3 attempts"]:::orange
+    RETRY -- "Still failing" --> ERR_AUTH
+
+    ERR_AUTH & ERR_404 & ERR_RATE --> FAIL["Increment <b>scrape_failures_total</b><br/>per entity_type"]:::red
+    PARSE --> BUILD
+    FAIL --> BUILD
+
+    BUILD["<b>Build fresh GaugeMetricFamily</b><br/>for each metric<br/><i>stale series auto-disappear</i>"]:::grey
+
+    BUILD --> LABELS["Attach labels per usageItem:<br/><b>type</b> | <b>name</b> | <b>product</b> | <b>sku</b><br/><b>model</b> | <b>unit</b> | <b>year</b>"]:::grey
+
+    LABELS --> YIELD
+
+    subgraph YIELD ["Metrics Yielded"]
+        direction LR
+        subgraph USAGE ["Usage Gauges"]
+            direction TB
+            M1["gross_quantity"]:::greenlight
+            M2["net_quantity"]:::greenlight
+            M3["discount_quantity"]:::greenlight
+            M4["gross_amount"]:::greenlight
+            M5["net_amount"]:::greenlight
+            M6["discount_amount"]:::greenlight
+            M7["price_per_unit"]:::greenlight
+        end
+        subgraph OPS ["Operational Metrics"]
+            direction TB
+            O1["scrape_success"]:::orangelight
+            O2["scrape_duration_seconds"]:::orangelight
+            O3["scrape_failures_total"]:::orangelight
+            O4["last_scrape_timestamp"]:::orangelight
+        end
+    end
+
+    YIELD --> TSDB["<b>PROMETHEUS TSDB</b><br/>Stores time series"]:::blue
+
+    TSDB --> GRAFANA(["<b>GRAFANA</b><br/>Per-model spend | Burn rate<br/>Top models | Discount ratio"]):::dash
+
+    classDef blue fill:#dbeafe,stroke:#2563eb,color:#1e3a5f,font-weight:bold,rx:8
+    classDef grey fill:#f1f5f9,stroke:#64748b,color:#1e293b,rx:6
+    classDef yellow fill:#fef9c3,stroke:#ca8a04,color:#713f12,font-weight:bold,rx:8
+    classDef green fill:#dcfce7,stroke:#16a34a,color:#14532d,rx:6
+    classDef red fill:#fee2e2,stroke:#dc2626,color:#7f1d1d,rx:6
+    classDef orange fill:#ffedd5,stroke:#ea580c,color:#7c2d12,rx:6
+    classDef purple fill:#f3e8ff,stroke:#9333ea,color:#581c87,rx:6
+    classDef greenlight fill:#ecfccb,stroke:#65a30d,color:#365314,rx:4,font-size:13px
+    classDef orangelight fill:#fed7aa,stroke:#ea580c,color:#7c2d12,rx:4,font-size:13px
+    classDef dash fill:#fff7ed,stroke:#f97316,color:#9a3412,font-weight:bold,rx:8
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <script>
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'base',
+            themeVariables: {
+                fontSize: '14px',
+                fontFamily: 'Segoe UI, system-ui, sans-serif',
+                lineColor: '#94a3b8',
+                primaryColor: '#f1f5f9',
+                primaryTextColor: '#1e293b',
+                primaryBorderColor: '#64748b'
+            },
+            flowchart: {
+                useMaxWidth: false,
+                htmlLabels: true,
+                curve: 'basis',
+                rankSpacing: 50,
+                nodeSpacing: 40,
+                padding: 15,
+                subGraphTitleMargin: { top: 10, bottom: 10 }
+            }
+        });
+    </script>
+</body>
+</html>

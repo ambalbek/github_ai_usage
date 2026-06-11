@@ -1,0 +1,39 @@
+version: "3.8"
+
+services:
+  exporter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      GITHUB_TOKEN: "${GITHUB_TOKEN}"
+    volumes:
+      - ./config.json:/app/config.json:ro
+    ports:
+      - "9185:9185"
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+volumes:
+  prometheus_data:
+  grafana_data:
