@@ -1,4 +1,10 @@
-"""Prometheus exporter for GitHub Copilot AI Credits / Premium Request usage."""
+"""Prometheus exporter for GitHub Copilot AI Credits / Premium Request usage.
+
+Multi-entity: iterates over one or more organizations and/or enterprises.
+For each entity it prefers the premium_request endpoint (which carries the
+per-model breakdown). If that returns no items it falls back to the general
+billing usage endpoint, filtered to AI-usage SKUs (seat licenses excluded).
+"""
 
 from __future__ import annotations
 
@@ -6,7 +12,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -36,7 +42,7 @@ USAGE_METRICS: dict[str, str] = {
     "github_premium_request_usage_price_per_unit": "pricePerUnit",
 }
 
-# Fallback endpoint (general /settings/billing/usage) uses different keys.
+# General endpoint uses "quantity" where premium_request splits gross/net.
 GENERAL_USAGE_FIELD_MAP: dict[str, str] = {
     "github_premium_request_usage_gross_quantity": "quantity",
     "github_premium_request_usage_net_quantity": "quantity",
@@ -49,14 +55,26 @@ GENERAL_USAGE_FIELD_MAP: dict[str, str] = {
 LABEL_NAMES = ["type", "name", "product", "sku", "model", "unit", "year", "month"]
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
+# Seat-license SKUs are subscriptions, NOT AI usage. Excluded from the general
+# fallback so they don't inflate spend totals. Compared case-insensitively.
+DEFAULT_EXCLUDE_SKUS = {"copilot business", "copilot enterprise"}
+
+
+def _as_list(value: Any) -> list[str]:
+    """Coerce a config value (list, comma string, or scalar) into a clean list."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    return [p.strip() for p in str(value).split(",") if p.strip()]
+
 
 @dataclass
 class ExporterConfig:
-    """Configuration loaded from config.json + GITHUB_TOKEN env var."""
-
     token: str
-    enterprise: str = ""
-    organization: str = ""
+    organizations: list[str] = field(default_factory=list)
+    enterprises: list[str] = field(default_factory=list)
+    exclude_skus: set[str] = field(default_factory=lambda: set(DEFAULT_EXCLUDE_SKUS))
     cache_ttl: int = 900
     http_timeout: int = 30
     port: int = 9185
@@ -66,30 +84,38 @@ class ExporterConfig:
     api_base: str = "https://api.github.com"
 
     @classmethod
-    def load(cls, config_path: Path = CONFIG_PATH) -> ExporterConfig:
+    def load(cls, config_path: Path = CONFIG_PATH) -> "ExporterConfig":
         token = os.environ.get("GITHUB_TOKEN", "")
         if not token:
             logger.critical("GITHUB_TOKEN environment variable is required")
             raise SystemExit(1)
-
         try:
             raw = json.loads(config_path.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError) as exc:
             logger.critical("Failed to read %s: %s", config_path, exc)
             raise SystemExit(1) from exc
 
-        enterprise = raw.get("github_enterprise", "").strip()
-        organization = raw.get("github_organization", "").strip()
-        if not enterprise and not organization:
+        # Accept plural arrays, legacy singular keys, and env overrides.
+        orgs = _as_list(raw.get("github_organizations")) or _as_list(raw.get("github_organization"))
+        ents = _as_list(raw.get("github_enterprises")) or _as_list(raw.get("github_enterprise"))
+        orgs = _as_list(os.environ.get("GITHUB_ORGS")) or orgs
+        ents = _as_list(os.environ.get("GITHUB_ENTERPRISES")) or ents
+
+        if not orgs and not ents:
             logger.critical(
-                "Set either github_enterprise or github_organization in config.json"
+                "Configure at least one of github_organizations / github_enterprises"
             )
             raise SystemExit(1)
 
+        exclude = raw.get("exclude_skus")
+        exclude_set = ({s.lower() for s in _as_list(exclude)}
+                       if exclude is not None else set(DEFAULT_EXCLUDE_SKUS))
+
         return cls(
             token=token,
-            enterprise=enterprise,
-            organization=organization,
+            organizations=orgs,
+            enterprises=ents,
+            exclude_skus=exclude_set,
             cache_ttl=raw.get("cache_ttl_seconds", 900),
             http_timeout=raw.get("http_timeout_seconds", 30),
             port=raw.get("exporter_port", 9185),
@@ -99,45 +125,33 @@ class ExporterConfig:
             api_base=raw.get("api_base", "https://api.github.com").rstrip("/"),
         )
 
-    @property
-    def entity_type(self) -> str:
-        return "enterprise" if self.enterprise else "organization"
-
-    @property
-    def entity_name(self) -> str:
-        return self.enterprise or self.organization
+    def entities(self) -> list[tuple[str, str]]:
+        """Return (type, name) pairs. type is 'organization' or 'enterprise'
+        to match the dashboard's `type` label values."""
+        return ([("enterprise", e) for e in self.enterprises]
+                + [("organization", o) for o in self.organizations])
 
 
 @dataclass
 class CacheEntry:
-    items: list[dict[str, Any]]
-    year: str
-    month: str
+    items: list[dict[str, Any]]   # each tagged with _type/_name/_year/_month
     expires_at: float
 
 
 class CopilotPremiumCollector:
     """Custom Prometheus collector for GitHub Copilot billing data."""
 
-    def __init__(
-        self,
-        config: ExporterConfig,
-        registry: CollectorRegistry | None = REGISTRY,
-    ):
+    def __init__(self, config: ExporterConfig, registry: CollectorRegistry | None = REGISTRY):
         self._config = config
         self._session = self._build_session()
         self._cache: CacheEntry | None = None
         self._cache_lock = Lock()
-        # Timestamp of the last *successful* GitHub fetch (0 until first success).
-        # Drives the "last scrape age" health signal — must reflect real data
-        # freshness, not the last time collect() happened to run.
         self._last_success_ts = 0.0
+        self._last_fetch_ok = 0
 
         self._scrape_duration = Histogram(
             "github_premium_request_scrape_duration_seconds",
             "Duration of a real GitHub billing API fetch (cache hits excluded)",
-            # Sized for billing API latency; default buckets cap at ~10s and
-            # would dump slow calls into +Inf, making p95 uncomputable.
             buckets=(0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0),
             registry=registry,
         )
@@ -146,47 +160,32 @@ class CopilotPremiumCollector:
             "Total number of failed GitHub billing API fetches",
             registry=registry,
         )
-
         if registry is not None:
             registry.register(self)
 
     def _build_session(self) -> requests.Session:
         session = requests.Session()
-        session.headers.update(
-            {
-                # Fix: GitHub's documented Accept header is vnd.github+json.
-                "Accept": "application/vnd.github+json",
-                "Authorization": f"Bearer {self._config.token}",
-                "X-GitHub-Api-Version": self._config.api_version,
-                "User-Agent": "copilot-premium-exporter/1.0",
-            }
-        )
-        retry = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[500, 502, 503, 504],
-            allowed_methods=["GET"],
-        )
+        session.headers.update({
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {self._config.token}",
+            "X-GitHub-Api-Version": self._config.api_version,
+            "User-Agent": "copilot-premium-exporter/2.0",
+        })
+        retry = Retry(total=3, backoff_factor=1,
+                      status_forcelist=[500, 502, 503, 504], allowed_methods=["GET"])
         session.mount("https://", HTTPAdapter(max_retries=retry))
         return session
 
-    def _endpoint(self, kind: str) -> str:
-        """Build the API URL. kind is 'premium_request' or 'general'."""
-        base = self._config.api_base
-        scope = "enterprises" if self._config.entity_type == "enterprise" else "organizations"
-        name = self._config.entity_name
-        if kind == "premium_request":
-            return f"{base}/{scope}/{name}/settings/billing/premium_request/usage"
-        return f"{base}/{scope}/{name}/settings/billing/usage"
+    def _endpoint(self, etype: str, name: str, kind: str) -> str:
+        scope = "enterprises" if etype == "enterprise" else "organizations"
+        suffix = "premium_request/usage" if kind == "premium_request" else "usage"
+        return f"{self._config.api_base}/{scope}/{name}/settings/billing/{suffix}"
 
     def _get(self, url: str) -> dict[str, Any] | None:
-        """GET a URL; return parsed JSON on 200, None on any failure.
+        """GET a billing URL; return parsed JSON on 200, else None.
 
-        No query params — the endpoint is undocumented for year/month and
-        passing them empirically causes empty responses.
-
-        Times only the real HTTP call (this method runs solely on cache miss),
-        so the duration histogram reflects true API latency, not cache hits.
+        Times only the real HTTP call so the duration histogram reflects true
+        API latency, not cache hits (this method runs solely on cache miss).
         """
         fetch_start = time.monotonic()
         try:
@@ -206,129 +205,133 @@ class CopilotPremiumCollector:
         body = resp.text[:300]
         if resp.status_code in (401, 403):
             logger.error(
-                "Auth failed (%d) for %s — token needs "
-                "manage_billing:enterprise (classic) or Billing:Read (fine-grained). Body: %s",
-                resp.status_code, url, body,
-            )
+                "Auth failed (%d) for %s — token needs manage_billing:enterprise "
+                "(classic) or Billing:Read (fine-grained). Body: %s",
+                resp.status_code, url, body)
         elif resp.status_code == 404:
             logger.error(
-                "404 for %s — wrong scope (org vs enterprise slug) or "
-                "entity not on Enhanced Billing Platform. Body: %s",
-                url, body,
-            )
+                "404 for %s — wrong scope (org vs enterprise slug) or entity not "
+                "on Enhanced Billing Platform. Body: %s", url, body)
         elif resp.status_code == 429 or resp.headers.get("X-RateLimit-Remaining") == "0":
-            logger.warning(
-                "Rate limited; resets at %s. Serving cached data.",
-                resp.headers.get("X-RateLimit-Reset", "unknown"),
-            )
+            logger.warning("Rate limited; resets at %s. Serving cached data.",
+                           resp.headers.get("X-RateLimit-Reset", "unknown"))
         else:
             logger.error("HTTP %d for %s: %s", resp.status_code, url, body)
         return None
 
-    def _fetch(self) -> CacheEntry | None:
-        """Return cached or freshly-fetched usage. Tries premium_request first,
-        falls back to general /settings/billing/usage if that returns nothing.
-        Post-June-2026 AI Credits data may live in either endpoint depending
-        on plan migration state.
+    def _tag(self, items: list[dict[str, Any]], etype: str, name: str,
+             year: str, month: str) -> list[dict[str, Any]]:
+        out = []
+        for it in items:
+            tagged = dict(it)
+            tagged["_type"] = etype
+            tagged["_name"] = name
+            tagged["_year"] = year
+            tagged["_month"] = month
+            # Normalize a missing or JSON-null model to "" so it renders as an
+            # empty label rather than the literal string "None".
+            if tagged.get("model") is None:
+                tagged["model"] = ""
+            out.append(tagged)
+        return out
+
+    def _fetch_entity(self, etype: str, name: str) -> tuple[list[dict[str, Any]], bool]:
+        """Fetch one entity. Returns (tagged_items, http_ok).
+
+        http_ok is True if at least one endpoint responded 200 (even if empty),
+        so a genuinely-zero-usage period is not treated as a failure.
         """
+        now = datetime.now(timezone.utc)
+        d_year, d_month = str(now.year), str(now.month)
+        ok = False
+
+        # Primary: premium_request (has the model field; no seat licenses).
+        data = self._get(self._endpoint(etype, name, "premium_request"))
+        if data is not None:
+            ok = True
+            tp = data.get("timePeriod", {}) or {}
+            year = str(tp.get("year", d_year))
+            month = str(tp.get("month", d_month))
+            items = data.get("usageItems", []) or []
+            if items:
+                logger.info("%s/%s premium_request -> %d items", etype, name, len(items))
+                return self._tag(items, etype, name, year, month), ok
+
+        # Fallback: general usage, filtered to AI SKUs (drop seat licenses).
+        logger.info("%s/%s premium_request empty -> general usage fallback", etype, name)
+        data = self._get(self._endpoint(etype, name, "usage"))
+        if data is not None:
+            ok = True
+            all_items = data.get("usageItems", []) or []
+            filtered = [
+                it for it in all_items
+                if (it.get("product") or "").lower() == "copilot"
+                and (it.get("sku") or "").strip().lower() not in self._config.exclude_skus
+            ]
+            dropped = len(all_items) - len(filtered)
+            logger.info("%s/%s general -> %d Copilot AI items (%d seat-license rows excluded)",
+                        etype, name, len(filtered), dropped)
+            return self._tag(filtered, etype, name, d_year, d_month), ok
+
+        return [], ok
+
+    def _fetch(self) -> CacheEntry:
         now = time.monotonic()
         with self._cache_lock:
             if self._cache and self._cache.expires_at > now:
                 return self._cache
 
-        utc_now = datetime.now(timezone.utc)
-        default_year = str(utc_now.year)
-        default_month = str(utc_now.month)
+        all_items: list[dict[str, Any]] = []
+        any_ok = False
+        for etype, name in self._config.entities():
+            items, ok = self._fetch_entity(etype, name)
+            all_items.extend(items)
+            any_ok = any_ok or ok
 
-        items: list[dict[str, Any]] = []
-        year, month = default_year, default_month
+        self._last_fetch_ok = 1 if any_ok else 0
+        if any_ok:
+            self._last_success_ts = time.time()
 
-        # Primary: premium_request endpoint (has the `model` field).
-        data = self._get(self._endpoint("premium_request"))
-        if data:
-            tp = data.get("timePeriod", {}) or {}
-            year = str(tp.get("year", default_year))
-            month = str(tp.get("month", default_month))
-            items = data.get("usageItems", []) or []
-            logger.info(
-                "premium_request endpoint returned %d items for %s/%s",
-                len(items), self._config.entity_type, self._config.entity_name,
-            )
-
-        # Fallback: general usage endpoint (no `model` field, but at least gets Copilot SKU spend).
-        if not items:
-            logger.info("Falling back to general /settings/billing/usage endpoint")
-            data = self._get(self._endpoint("general"))
-            if data:
-                all_items = data.get("usageItems", []) or []
-                items = [
-                    {**i, "model": ""}  # general endpoint has no model field
-                    for i in all_items
-                    if (i.get("product") or "").lower() == "copilot"
-                ]
-                logger.info("general endpoint returned %d Copilot items", len(items))
-
-        if data is None and not items:
-            return None  # complete failure — don't poison the cache
-
-        entry = CacheEntry(
-            items=items,
-            year=year,
-            month=month,
-            expires_at=time.monotonic() + self._config.cache_ttl,
-        )
+        entry = CacheEntry(items=all_items, expires_at=time.monotonic() + self._config.cache_ttl)
         with self._cache_lock:
             self._cache = entry
-        # Mark freshness only on a real successful fetch — this is what the
-        # "last scrape age" health panel keys off of.
-        self._last_success_ts = time.time()
         return entry
 
     def collect(self) -> Iterable[GaugeMetricFamily]:
-        entry = self._fetch()
-        # Duration is observed inside _get (real HTTP only); do NOT observe
-        # here, or every cache-hit collect() would pollute the histogram.
+        entry = self._fetch()  # duration observed inside _get on real HTTP only
 
-        families = {
-            name: GaugeMetricFamily(name, USAGE_METRICS[name], labels=LABEL_NAMES)
-            for name in USAGE_METRICS
-        }
+        families = {name: GaugeMetricFamily(name, USAGE_METRICS[name], labels=LABEL_NAMES)
+                    for name in USAGE_METRICS}
 
-        if entry is not None:
-            for item in entry.items:
-                # Premium-request schema has separate gross/net quantities;
-                # general schema has only "quantity". Use a per-metric fallback.
-                label_values = [
-                    self._config.entity_type,
-                    self._config.entity_name,
-                    str(item.get("product", "")),
-                    str(item.get("sku", "")),
-                    str(item.get("model", "")),
-                    str(item.get("unitType", "")),
-                    entry.year,
-                    entry.month,
-                ]
-                for metric_name, json_key in USAGE_METRICS.items():
-                    value = item.get(json_key)
-                    if value is None:
-                        # General endpoint fallback for missing keys.
-                        fallback_key = GENERAL_USAGE_FIELD_MAP.get(metric_name)
-                        value = item.get(fallback_key, 0) if fallback_key else 0
-                    families[metric_name].add_metric(label_values, float(value or 0))
+        for item in entry.items:
+            label_values = [
+                item.get("_type", ""),
+                item.get("_name", ""),
+                str(item.get("product", "")),
+                str(item.get("sku", "")),
+                str(item.get("model", "")),
+                str(item.get("unitType", "")),
+                item.get("_year", ""),
+                item.get("_month", ""),
+            ]
+            for metric_name, json_key in USAGE_METRICS.items():
+                value = item.get(json_key)
+                if value is None:
+                    fb = GENERAL_USAGE_FIELD_MAP.get(metric_name)
+                    value = item.get(fb, 0) if fb else 0
+                families[metric_name].add_metric(label_values, float(value or 0))
 
         yield from families.values()
 
         success = GaugeMetricFamily(
             "github_premium_request_scrape_success",
-            "1 if last scrape succeeded and returned any items, else 0",
-        )
-        success.add_metric([], 1.0 if entry and entry.items else 0.0)
+            "1 if the last refresh reached GitHub for at least one entity, else 0")
+        success.add_metric([], float(self._last_fetch_ok))
         yield success
 
         last = GaugeMetricFamily(
             "github_premium_request_last_scrape_timestamp_seconds",
-            "Unix timestamp of the last SUCCESSFUL GitHub fetch (0 if never)",
-        )
+            "Unix timestamp of the last SUCCESSFUL GitHub fetch (0 if never)")
         last.add_metric([], self._last_success_ts)
         yield last
 
@@ -337,12 +340,10 @@ def main() -> None:
     config = ExporterConfig.load()
     logging.basicConfig(
         level=getattr(logging, config.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
-    logger.info(
-        "Starting exporter on %s:%d (%s=%s, cache_ttl=%ds)",
-        config.host, config.port, config.entity_type, config.entity_name, config.cache_ttl,
-    )
+        format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logger.info("Starting exporter on %s:%d | orgs=%s enterprises=%s | cache_ttl=%ds",
+                config.host, config.port, config.organizations, config.enterprises,
+                config.cache_ttl)
     CopilotPremiumCollector(config)
     start_http_server(config.port, addr=config.host)
     logger.info("Exporter ready — metrics on /metrics")

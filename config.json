@@ -1,9 +1,16 @@
 {
-    "github_enterprise": "my-enterprise",
-    "api_version": "2022-11-28",
-    "cache_ttl_seconds": 900,
-    "http_timeout_seconds": 30,
-    "exporter_port": 9185,
-    "exporter_host": "0.0.0.0",
-    "log_level": "INFO"
+  "_comment": "Point this at the ORGS where premium_request returns per-model data (your CLI proved org-level works). You can also list enterprises; each is tried independently. GITHUB_TOKEN comes from the environment, never this file.",
+
+  "github_organizations": ["your-org-1", "your-org-2"],
+  "github_enterprises": [],
+
+  "_exclude_comment": "Seat-license SKUs to drop from the general-endpoint fallback so they don't inflate AI-usage spend. Default is Copilot Business + Copilot Enterprise. Override here if your plan exposes other non-usage SKUs.",
+  "exclude_skus": ["Copilot Business", "Copilot Enterprise"],
+
+  "cache_ttl_seconds": 900,
+  "http_timeout_seconds": 30,
+  "exporter_port": 9185,
+  "exporter_host": "0.0.0.0",
+  "log_level": "INFO",
+  "api_version": "2022-11-28"
 }
