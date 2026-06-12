@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import time
-from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,10 +36,14 @@ USAGE_METRICS: dict[str, str] = {
     "github_premium_request_usage_price_per_unit": "pricePerUnit",
 }
 
-# Fields that should be summed when aggregating multiple items for the same model.
-SUMMABLE_FIELDS = {
-    "grossQuantity", "netQuantity", "discountQuantity",
-    "grossAmount", "netAmount", "discountAmount",
+# Fallback endpoint (general /settings/billing/usage) uses different keys.
+GENERAL_USAGE_FIELD_MAP: dict[str, str] = {
+    "github_premium_request_usage_gross_quantity": "quantity",
+    "github_premium_request_usage_net_quantity": "quantity",
+    "github_premium_request_usage_gross_amount": "grossAmount",
+    "github_premium_request_usage_net_amount": "netAmount",
+    "github_premium_request_usage_discount_amount": "discountAmount",
+    "github_premium_request_usage_price_per_unit": "pricePerUnit",
 }
 
 LABEL_NAMES = ["type", "name", "product", "sku", "model", "unit", "year", "month"]
@@ -113,35 +116,6 @@ class CacheEntry:
     expires_at: float
 
 
-def _aggregate_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Aggregate usageItems by (product, sku, model, unitType).
-
-    The GitHub API may return multiple entries for the same model (e.g. one per
-    day or per org within an enterprise). The UI shows the sum, so we must
-    aggregate to match. Summable fields (quantities, amounts) are added up;
-    pricePerUnit is kept from the last entry (it's the same across entries).
-    """
-    buckets: dict[tuple[str, str, str, str], dict[str, Any]] = {}
-
-    for item in items:
-        key = (
-            item.get("product", ""),
-            item.get("sku", ""),
-            item.get("model", ""),
-            item.get("unitType", ""),
-        )
-        if key not in buckets:
-            buckets[key] = dict(item)  # shallow copy of first entry
-        else:
-            existing = buckets[key]
-            for field in SUMMABLE_FIELDS:
-                existing[field] = existing.get(field, 0) + item.get(field, 0)
-            # pricePerUnit is constant per model — keep latest
-            existing["pricePerUnit"] = item.get("pricePerUnit", existing.get("pricePerUnit", 0))
-
-    return list(buckets.values())
-
-
 class CopilotPremiumCollector:
     """Custom Prometheus collector for GitHub Copilot billing data."""
 
@@ -154,15 +128,22 @@ class CopilotPremiumCollector:
         self._session = self._build_session()
         self._cache: CacheEntry | None = None
         self._cache_lock = Lock()
+        # Timestamp of the last *successful* GitHub fetch (0 until first success).
+        # Drives the "last scrape age" health signal — must reflect real data
+        # freshness, not the last time collect() happened to run.
+        self._last_success_ts = 0.0
 
         self._scrape_duration = Histogram(
             "github_premium_request_scrape_duration_seconds",
-            "Duration of premium request data collection",
+            "Duration of a real GitHub billing API fetch (cache hits excluded)",
+            # Sized for billing API latency; default buckets cap at ~10s and
+            # would dump slow calls into +Inf, making p95 uncomputable.
+            buckets=(0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0),
             registry=registry,
         )
         self._scrape_failures = Counter(
             "github_premium_request_scrape_failures_total",
-            "Total number of failed scrapes",
+            "Total number of failed GitHub billing API fetches",
             registry=registry,
         )
 
@@ -173,6 +154,7 @@ class CopilotPremiumCollector:
         session = requests.Session()
         session.headers.update(
             {
+                # Fix: GitHub's documented Accept header is vnd.github+json.
                 "Accept": "application/vnd.github+json",
                 "Authorization": f"Bearer {self._config.token}",
                 "X-GitHub-Api-Version": self._config.api_version,
@@ -188,21 +170,34 @@ class CopilotPremiumCollector:
         session.mount("https://", HTTPAdapter(max_retries=retry))
         return session
 
-    def _endpoint(self) -> str:
-        """Build the premium_request billing API URL."""
+    def _endpoint(self, kind: str) -> str:
+        """Build the API URL. kind is 'premium_request' or 'general'."""
         base = self._config.api_base
         scope = "enterprises" if self._config.entity_type == "enterprise" else "organizations"
         name = self._config.entity_name
-        return f"{base}/{scope}/{name}/settings/billing/premium_request/usage"
+        if kind == "premium_request":
+            return f"{base}/{scope}/{name}/settings/billing/premium_request/usage"
+        return f"{base}/{scope}/{name}/settings/billing/usage"
 
-    def _get(self, url: str, params: dict[str, Any] | None = None) -> dict[str, Any] | None:
-        """GET a URL; return parsed JSON on 200, None on any failure."""
+    def _get(self, url: str) -> dict[str, Any] | None:
+        """GET a URL; return parsed JSON on 200, None on any failure.
+
+        No query params — the endpoint is undocumented for year/month and
+        passing them empirically causes empty responses.
+
+        Times only the real HTTP call (this method runs solely on cache miss),
+        so the duration histogram reflects true API latency, not cache hits.
+        """
+        fetch_start = time.monotonic()
         try:
-            resp = self._session.get(url, params=params, timeout=self._config.http_timeout)
+            resp = self._session.get(url, timeout=self._config.http_timeout)
         except requests.RequestException as exc:
+            self._scrape_duration.observe(time.monotonic() - fetch_start)
             logger.error("HTTP error on %s: %s", url, exc)
             self._scrape_failures.inc()
             return None
+
+        self._scrape_duration.observe(time.monotonic() - fetch_start)
 
         if resp.status_code == 200:
             return resp.json()
@@ -212,14 +207,14 @@ class CopilotPremiumCollector:
         if resp.status_code in (401, 403):
             logger.error(
                 "Auth failed (%d) for %s — token needs "
-                "manage_billing:copilot + read:enterprise (classic) "
-                "or Billing: read (fine-grained). Body: %s",
+                "manage_billing:enterprise (classic) or Billing:Read (fine-grained). Body: %s",
                 resp.status_code, url, body,
             )
         elif resp.status_code == 404:
             logger.error(
-                "404 for %s — entity not on Enhanced Billing Platform "
-                "or wrong slug. Body: %s", url, body,
+                "404 for %s — wrong scope (org vs enterprise slug) or "
+                "entity not on Enhanced Billing Platform. Body: %s",
+                url, body,
             )
         elif resp.status_code == 429 or resp.headers.get("X-RateLimit-Remaining") == "0":
             logger.warning(
@@ -231,11 +226,10 @@ class CopilotPremiumCollector:
         return None
 
     def _fetch(self) -> CacheEntry | None:
-        """Return cached or freshly-fetched usage for the current month.
-
-        No year/month query params — the API returns current period data
-        without them. Items for the same model are aggregated (summed) because
-        the API may return multiple rows per model.
+        """Return cached or freshly-fetched usage. Tries premium_request first,
+        falls back to general /settings/billing/usage if that returns nothing.
+        Post-June-2026 AI Credits data may live in either endpoint depending
+        on plan migration state.
         """
         now = time.monotonic()
         with self._cache_lock:
@@ -243,43 +237,57 @@ class CopilotPremiumCollector:
                 return self._cache
 
         utc_now = datetime.now(timezone.utc)
+        default_year = str(utc_now.year)
+        default_month = str(utc_now.month)
 
-        data = self._get(self._endpoint())
-        if data is None:
-            return None
+        items: list[dict[str, Any]] = []
+        year, month = default_year, default_month
 
-        tp = data.get("timePeriod", {}) or {}
-        resp_year = str(tp.get("year", utc_now.year))
-        resp_month = str(tp.get("month", utc_now.month))
+        # Primary: premium_request endpoint (has the `model` field).
+        data = self._get(self._endpoint("premium_request"))
+        if data:
+            tp = data.get("timePeriod", {}) or {}
+            year = str(tp.get("year", default_year))
+            month = str(tp.get("month", default_month))
+            items = data.get("usageItems", []) or []
+            logger.info(
+                "premium_request endpoint returned %d items for %s/%s",
+                len(items), self._config.entity_type, self._config.entity_name,
+            )
 
-        raw_items = data.get("usageItems", []) or []
-        items = _aggregate_items(raw_items)
+        # Fallback: general usage endpoint (no `model` field, but at least gets Copilot SKU spend).
+        if not items:
+            logger.info("Falling back to general /settings/billing/usage endpoint")
+            data = self._get(self._endpoint("general"))
+            if data:
+                all_items = data.get("usageItems", []) or []
+                items = [
+                    {**i, "model": ""}  # general endpoint has no model field
+                    for i in all_items
+                    if (i.get("product") or "").lower() == "copilot"
+                ]
+                logger.info("general endpoint returned %d Copilot items", len(items))
 
-        logger.info(
-            "Fetched %d raw items, aggregated to %d for %s/%s (period %s-%s)",
-            len(raw_items), len(items),
-            self._config.entity_type, self._config.entity_name,
-            resp_year, resp_month,
-        )
+        if data is None and not items:
+            return None  # complete failure — don't poison the cache
 
         entry = CacheEntry(
             items=items,
-            year=resp_year,
-            month=resp_month,
+            year=year,
+            month=month,
             expires_at=time.monotonic() + self._config.cache_ttl,
         )
         with self._cache_lock:
             self._cache = entry
+        # Mark freshness only on a real successful fetch — this is what the
+        # "last scrape age" health panel keys off of.
+        self._last_success_ts = time.time()
         return entry
 
-    def describe(self) -> list[GaugeMetricFamily]:
-        """Return empty metric families — avoids a collect() call at startup."""
-        return [GaugeMetricFamily(name, "", labels=LABEL_NAMES) for name in USAGE_METRICS]
-
     def collect(self) -> Iterable[GaugeMetricFamily]:
-        start = time.monotonic()
         entry = self._fetch()
-        self._scrape_duration.observe(time.monotonic() - start)
+        # Duration is observed inside _get (real HTTP only); do NOT observe
+        # here, or every cache-hit collect() would pollute the histogram.
 
         families = {
             name: GaugeMetricFamily(name, USAGE_METRICS[name], labels=LABEL_NAMES)
@@ -288,6 +296,8 @@ class CopilotPremiumCollector:
 
         if entry is not None:
             for item in entry.items:
+                # Premium-request schema has separate gross/net quantities;
+                # general schema has only "quantity". Use a per-metric fallback.
                 label_values = [
                     self._config.entity_type,
                     self._config.entity_name,
@@ -299,23 +309,27 @@ class CopilotPremiumCollector:
                     entry.month,
                 ]
                 for metric_name, json_key in USAGE_METRICS.items():
-                    value = item.get(json_key, 0)
+                    value = item.get(json_key)
+                    if value is None:
+                        # General endpoint fallback for missing keys.
+                        fallback_key = GENERAL_USAGE_FIELD_MAP.get(metric_name)
+                        value = item.get(fallback_key, 0) if fallback_key else 0
                     families[metric_name].add_metric(label_values, float(value or 0))
 
         yield from families.values()
 
         success = GaugeMetricFamily(
             "github_premium_request_scrape_success",
-            "1 if last scrape succeeded and returned items, else 0",
+            "1 if last scrape succeeded and returned any items, else 0",
         )
         success.add_metric([], 1.0 if entry and entry.items else 0.0)
         yield success
 
         last = GaugeMetricFamily(
             "github_premium_request_last_scrape_timestamp_seconds",
-            "Unix timestamp of the last scrape attempt",
+            "Unix timestamp of the last SUCCESSFUL GitHub fetch (0 if never)",
         )
-        last.add_metric([], time.time())
+        last.add_metric([], self._last_success_ts)
         yield last
 
 
