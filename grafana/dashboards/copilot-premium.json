@@ -1100,6 +1100,18 @@
           "instant": true,
           "format": "table",
           "range": false
+        },
+        {
+          "refId": "H",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (model) (github_premium_request_usage_net_amount{type=~\"$entity_type\", name=~\"$entity\", product=~\"$product\", sku=~\"$sku\", model=~\"$model\"}) / 0.01",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table",
+          "range": false
         }
       ],
       "transformations": [
@@ -1118,6 +1130,7 @@
               "Value #E": "Discount requests",
               "Value #F": "Avg price/unit $",
               "Value #G": "Gross requests",
+              "Value #H": "Credits",
               "model": "Model"
             },
             "excludeByName": {
@@ -1125,13 +1138,14 @@
             },
             "indexByName": {
               "model": 0,
-              "Value #B": 1,
-              "Value #A": 2,
-              "Value #C": 3,
-              "Value #F": 4,
-              "Value #G": 5,
-              "Value #D": 6,
-              "Value #E": 7
+              "Value #H": 1,
+              "Value #B": 2,
+              "Value #A": 3,
+              "Value #C": 4,
+              "Value #F": 5,
+              "Value #G": 6,
+              "Value #D": 7,
+              "Value #E": 8
             }
           }
         }
@@ -1225,6 +1239,29 @@
                 }
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Credits"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "gradient"
+                }
+              }
+            ]
           }
         ]
       },
@@ -1236,6 +1273,7 @@
             "sum"
           ],
           "fields": [
+            "Credits",
             "Net $",
             "Gross $",
             "Discount $"
@@ -1243,7 +1281,7 @@
         },
         "sortBy": [
           {
-            "displayName": "Net $",
+            "displayName": "Credits",
             "desc": true
           }
         ]
