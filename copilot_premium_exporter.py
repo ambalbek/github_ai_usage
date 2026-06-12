@@ -233,8 +233,8 @@ class CopilotPremiumCollector:
     def _fetch(self) -> CacheEntry | None:
         """Return cached or freshly-fetched usage for the current month.
 
-        Passes year and month query params to match what the GitHub billing
-        UI shows. Items for the same model are aggregated (summed) because
+        No year/month query params — the API returns current period data
+        without them. Items for the same model are aggregated (summed) because
         the API may return multiple rows per model.
         """
         now = time.monotonic()
@@ -243,16 +243,14 @@ class CopilotPremiumCollector:
                 return self._cache
 
         utc_now = datetime.now(timezone.utc)
-        year = utc_now.year
-        month = utc_now.month
 
-        data = self._get(self._endpoint(), params={"year": year, "month": month})
+        data = self._get(self._endpoint())
         if data is None:
             return None
 
         tp = data.get("timePeriod", {}) or {}
-        resp_year = str(tp.get("year", year))
-        resp_month = str(tp.get("month", month))
+        resp_year = str(tp.get("year", utc_now.year))
+        resp_month = str(tp.get("month", utc_now.month))
 
         raw_items = data.get("usageItems", []) or []
         items = _aggregate_items(raw_items)

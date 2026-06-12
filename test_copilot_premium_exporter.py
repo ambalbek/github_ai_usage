@@ -351,13 +351,12 @@ class TestNotFound:
 
 class TestQueryParams:
     @responses.activate
-    def test_passes_year_and_month(self) -> None:
-        """Verify the API call includes year and month query params."""
+    def test_no_query_params(self) -> None:
+        """API is called without year/month params — returns current period by default."""
         responses.get(ENT_URL, json=SAMPLE_RESPONSE, status=200)
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         list(collector.collect())
 
         assert len(responses.calls) == 1
         url = responses.calls[0].request.url
-        assert "year=" in url
-        assert "month=" in url
+        assert "?" not in url
