@@ -390,39 +390,72 @@
         "sortBy": [{ "desc": true, "displayName": "Net $" }],
         "frameIndex": 0
       },
-      "title": "All Models — Spend Detail",
+      "title": "All Models — Full Detail",
       "type": "table",
-      "fieldConfig": {
-        "defaults": { "custom": { "filterable": true } },
-        "overrides": [
-          { "matcher": { "id": "byName", "options": "Value #A" }, "properties": [{ "id": "displayName", "value": "Gross $" }, { "id": "unit", "value": "currencyUSD" }] },
-          { "matcher": { "id": "byName", "options": "Value #B" }, "properties": [{ "id": "displayName", "value": "Net $" }, { "id": "unit", "value": "currencyUSD" }] },
-          { "matcher": { "id": "byName", "options": "Value #C" }, "properties": [{ "id": "displayName", "value": "Discount $" }, { "id": "unit", "value": "currencyUSD" }] },
-          { "matcher": { "id": "byName", "options": "Value #D" }, "properties": [{ "id": "displayName", "value": "Gross Qty" }] },
-          { "matcher": { "id": "byName", "options": "Value #E" }, "properties": [{ "id": "displayName", "value": "Net Qty" }] },
-          { "matcher": { "id": "byName", "options": "Value #F" }, "properties": [{ "id": "displayName", "value": "Discount Qty" }] },
-          { "matcher": { "id": "byName", "options": "Value #G" }, "properties": [{ "id": "displayName", "value": "$/Unit" }, { "id": "unit", "value": "currencyUSD" }] },
-          { "matcher": { "id": "byName", "options": "Time" }, "properties": [{ "id": "custom.hidden", "value": true }] },
-          { "matcher": { "id": "byName", "options": "type" }, "properties": [{ "id": "custom.hidden", "value": true }] },
-          { "matcher": { "id": "byName", "options": "unit" }, "properties": [{ "id": "custom.hidden", "value": true }] },
-          { "matcher": { "id": "byName", "options": "sku" }, "properties": [{ "id": "custom.hidden", "value": true }] },
-          { "matcher": { "id": "byName", "options": "year" }, "properties": [{ "id": "custom.hidden", "value": true }] },
-          { "matcher": { "id": "byName", "options": "__name__" }, "properties": [{ "id": "custom.hidden", "value": true }] },
-          { "matcher": { "id": "byName", "options": "job" }, "properties": [{ "id": "custom.hidden", "value": true }] },
-          { "matcher": { "id": "byName", "options": "instance" }, "properties": [{ "id": "custom.hidden", "value": true }] }
-        ]
-      },
       "transformations": [
-        { "id": "merge", "options": {} }
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "type": true, "name": false, "unit": true, "year": true, "sku": true },
+            "indexByName": {},
+            "renameByName": { "model": "Model", "product": "Product", "name": "Org" }
+          }
+        }
       ],
       "targets": [
-        { "expr": "github_premium_request_usage_gross_amount", "format": "table", "instant": true, "refId": "A" },
-        { "expr": "github_premium_request_usage_net_amount", "format": "table", "instant": true, "refId": "B" },
-        { "expr": "github_premium_request_usage_discount_amount", "format": "table", "instant": true, "refId": "C" },
-        { "expr": "github_premium_request_usage_gross_quantity", "format": "table", "instant": true, "refId": "D" },
-        { "expr": "github_premium_request_usage_net_quantity", "format": "table", "instant": true, "refId": "E" },
-        { "expr": "github_premium_request_usage_discount_quantity", "format": "table", "instant": true, "refId": "F" },
-        { "expr": "github_premium_request_usage_price_per_unit", "format": "table", "instant": true, "refId": "G" }
+        {
+          "expr": "github_premium_request_usage_gross_amount",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "",
+          "refId": "gross_amount"
+        },
+        {
+          "expr": "github_premium_request_usage_net_amount",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "",
+          "refId": "net_amount"
+        },
+        {
+          "expr": "github_premium_request_usage_discount_amount",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "",
+          "refId": "discount_amount"
+        },
+        {
+          "expr": "github_premium_request_usage_gross_quantity",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "",
+          "refId": "gross_qty"
+        },
+        {
+          "expr": "github_premium_request_usage_net_quantity",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "",
+          "refId": "net_qty"
+        },
+        {
+          "expr": "github_premium_request_usage_discount_quantity",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "",
+          "refId": "discount_qty"
+        },
+        {
+          "expr": "github_premium_request_usage_price_per_unit",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "",
+          "refId": "price"
+        }
       ]
     },
     {

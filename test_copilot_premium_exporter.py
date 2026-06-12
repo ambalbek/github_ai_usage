@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 
 import responses
 from prometheus_client import CollectorRegistry
 
-from copilot_premium_exporter import CopilotPremiumCollector, ExporterConfig
+from copilot_premium_exporter import (
+    CopilotPremiumCollector,
+    ExporterConfig,
+    _aggregate_items,
+)
 
 SAMPLE_RESPONSE = {
     "timePeriod": {"year": 2026, "month": 6},
@@ -43,17 +46,45 @@ SAMPLE_RESPONSE = {
     ],
 }
 
+# Simulates API returning multiple rows for the same model (e.g. per-day or per-org).
+DUPLICATE_MODEL_RESPONSE = {
+    "timePeriod": {"year": 2026, "month": 6},
+    "usageItems": [
+        {
+            "product": "Copilot",
+            "sku": "Copilot Premium Request",
+            "model": "GPT-5",
+            "unitType": "requests",
+            "pricePerUnit": 0.04,
+            "grossQuantity": 60,
+            "grossAmount": 2.4,
+            "discountQuantity": 0,
+            "discountAmount": 0.0,
+            "netQuantity": 60,
+            "netAmount": 2.4,
+        },
+        {
+            "product": "Copilot",
+            "sku": "Copilot Premium Request",
+            "model": "GPT-5",
+            "unitType": "requests",
+            "pricePerUnit": 0.04,
+            "grossQuantity": 40,
+            "grossAmount": 1.6,
+            "discountQuantity": 0,
+            "discountAmount": 0.0,
+            "netQuantity": 40,
+            "netAmount": 1.6,
+        },
+    ],
+}
+
 EMPTY_RESPONSE = {"timePeriod": {"year": 2026, "month": 6}, "usageItems": []}
 
-# The exporter calls the premium_request endpoint without query params.
-PREMIUM_URL = (
+# The exporter passes year/month query params.
+ENT_URL = (
     "https://api.github.com/enterprises/test-ent"
     "/settings/billing/premium_request/usage"
-)
-# Fallback general billing endpoint.
-GENERAL_URL = (
-    "https://api.github.com/enterprises/test-ent"
-    "/settings/billing/usage"
 )
 
 
@@ -69,6 +100,27 @@ def _collect_as_dict(collector: CopilotPremiumCollector) -> dict[str, list]:
     for family in collector.collect():
         result[family.name] = list(family.samples)
     return result
+
+
+class TestAggregation:
+    def test_duplicate_models_are_summed(self) -> None:
+        """Multiple items for the same model should be summed."""
+        items = DUPLICATE_MODEL_RESPONSE["usageItems"]
+        aggregated = _aggregate_items(items)
+        assert len(aggregated) == 1
+        assert aggregated[0]["grossQuantity"] == 100
+        assert aggregated[0]["netQuantity"] == 100
+        assert abs(aggregated[0]["grossAmount"] - 4.0) < 0.001
+        assert abs(aggregated[0]["netAmount"] - 4.0) < 0.001
+        assert aggregated[0]["pricePerUnit"] == 0.04
+
+    def test_different_models_stay_separate(self) -> None:
+        items = SAMPLE_RESPONSE["usageItems"]
+        aggregated = _aggregate_items(items)
+        assert len(aggregated) == 2
+
+    def test_empty_items(self) -> None:
+        assert _aggregate_items([]) == []
 
 
 class TestConstructor:
@@ -144,7 +196,7 @@ class TestLoadConfig:
 class TestCollectWithData:
     @responses.activate
     def test_yields_expected_families(self) -> None:
-        responses.get(PREMIUM_URL, json=SAMPLE_RESPONSE, status=200)
+        responses.get(ENT_URL, json=SAMPLE_RESPONSE, status=200)
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         metrics = _collect_as_dict(collector)
 
@@ -156,12 +208,12 @@ class TestCollectWithData:
 
     @responses.activate
     def test_correct_label_values(self) -> None:
-        responses.get(PREMIUM_URL, json=SAMPLE_RESPONSE, status=200)
+        responses.get(ENT_URL, json=SAMPLE_RESPONSE, status=200)
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         metrics = _collect_as_dict(collector)
 
         gross_qty_samples = metrics["github_premium_request_usage_gross_quantity"]
-        assert len(gross_qty_samples) == 2  # Two models
+        assert len(gross_qty_samples) == 2  # Two distinct models
 
         gpt5 = [s for s in gross_qty_samples if s.labels["model"] == "GPT-5"]
         assert len(gpt5) == 1
@@ -175,16 +227,12 @@ class TestCollectWithData:
     @responses.activate
     def test_all_seven_metric_values(self) -> None:
         """Verify every usage metric maps to the correct JSON field."""
-        responses.get(PREMIUM_URL, json=SAMPLE_RESPONSE, status=200)
+        responses.get(ENT_URL, json=SAMPLE_RESPONSE, status=200)
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         metrics = _collect_as_dict(collector)
 
-        # Check GPT-5 values across all metrics
-        def gpt5_value(metric_name: str) -> float:
-            samples = metrics[metric_name]
-            match = [s for s in samples if s.labels["model"] == "GPT-5"]
-            assert len(match) == 1, f"Expected 1 GPT-5 sample for {metric_name}, got {len(match)}"
-            return match[0].value
+        def gpt5_value(name: str) -> float:
+            return [s for s in metrics[name] if s.labels["model"] == "GPT-5"][0].value
 
         assert gpt5_value("github_premium_request_usage_gross_quantity") == 100.0
         assert gpt5_value("github_premium_request_usage_net_quantity") == 100.0
@@ -196,7 +244,7 @@ class TestCollectWithData:
 
     @responses.activate
     def test_discount_values(self) -> None:
-        responses.get(PREMIUM_URL, json=SAMPLE_RESPONSE, status=200)
+        responses.get(ENT_URL, json=SAMPLE_RESPONSE, status=200)
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         metrics = _collect_as_dict(collector)
 
@@ -207,82 +255,43 @@ class TestCollectWithData:
 
     @responses.activate
     def test_scrape_success_is_one(self) -> None:
-        responses.get(PREMIUM_URL, json=SAMPLE_RESPONSE, status=200)
+        responses.get(ENT_URL, json=SAMPLE_RESPONSE, status=200)
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         metrics = _collect_as_dict(collector)
         assert metrics["github_premium_request_scrape_success"][0].value == 1.0
 
 
-class TestFallbackEndpoint:
+class TestDuplicateModelAggregation:
     @responses.activate
-    def test_falls_back_to_general_when_premium_empty(self) -> None:
-        """When premium_request returns empty usageItems, try general billing."""
-        responses.get(PREMIUM_URL, json=EMPTY_RESPONSE, status=200)
-        general_response = {
-            "usageItems": [
-                {
-                    "product": "Copilot",
-                    "sku": "Copilot Premium Request",
-                    "unitType": "requests",
-                    "quantity": 500,
-                    "grossAmount": 20.0,
-                    "netAmount": 18.0,
-                    "discountAmount": 2.0,
-                    "pricePerUnit": 0.04,
-                },
-                {
-                    "product": "Actions",
-                    "sku": "Actions Minutes",
-                    "unitType": "minutes",
-                    "quantity": 1000,
-                    "grossAmount": 10.0,
-                    "netAmount": 10.0,
-                    "discountAmount": 0.0,
-                    "pricePerUnit": 0.01,
-                },
-            ],
-        }
-        responses.get(GENERAL_URL, json=general_response, status=200)
-
+    def test_duplicate_models_are_aggregated_in_metrics(self) -> None:
+        """API returning 2 rows for GPT-5 should produce 1 metric with summed values."""
+        responses.get(ENT_URL, json=DUPLICATE_MODEL_RESPONSE, status=200)
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         metrics = _collect_as_dict(collector)
 
-        # Should only pick up Copilot items, not Actions
         gross_qty = metrics["github_premium_request_usage_gross_quantity"]
-        assert len(gross_qty) == 1
-        assert gross_qty[0].labels["product"] == "Copilot"
-        assert gross_qty[0].labels["model"] == ""  # General endpoint has no model
+        assert len(gross_qty) == 1  # One model after aggregation
+        assert gross_qty[0].value == 100.0  # 60 + 40
 
-    @responses.activate
-    def test_no_fallback_when_premium_has_data(self) -> None:
-        """Should NOT call general endpoint when premium_request has data."""
-        responses.get(PREMIUM_URL, json=SAMPLE_RESPONSE, status=200)
-        responses.get(GENERAL_URL, json={"usageItems": []}, status=200)
-
-        collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
-        list(collector.collect())
-
-        # Only the premium_request endpoint should have been called
-        assert len(responses.calls) == 1
-        assert "premium_request" in responses.calls[0].request.url
+        net_amt = metrics["github_premium_request_usage_net_amount"]
+        assert abs(net_amt[0].value - 4.0) < 0.001  # 2.4 + 1.6
 
 
 class TestCacheTTL:
     @responses.activate
     def test_two_scrapes_within_ttl_make_one_call(self) -> None:
-        responses.get(PREMIUM_URL, json=SAMPLE_RESPONSE, status=200)
+        responses.get(ENT_URL, json=SAMPLE_RESPONSE, status=200)
         collector = CopilotPremiumCollector(_config(cache_ttl=600), registry=CollectorRegistry())
 
         list(collector.collect())
-        first_count = len(responses.calls)
-        assert first_count == 1
+        assert len(responses.calls) == 1
 
         list(collector.collect())
-        assert len(responses.calls) == first_count  # Cache hit, no new calls
+        assert len(responses.calls) == 1  # Cache hit
 
     @responses.activate
     def test_scrape_after_ttl_expires_makes_new_call(self) -> None:
-        responses.get(PREMIUM_URL, json=SAMPLE_RESPONSE, status=200)
+        responses.get(ENT_URL, json=SAMPLE_RESPONSE, status=200)
         collector = CopilotPremiumCollector(_config(cache_ttl=0), registry=CollectorRegistry())
 
         list(collector.collect())
@@ -294,11 +303,8 @@ class TestCacheTTL:
 
 class TestEmptyUsageItems:
     @responses.activate
-    def test_empty_everywhere_yields_no_series(self) -> None:
-        """Both endpoints return empty — no usage metrics, scrape_success=0."""
-        responses.get(PREMIUM_URL, json=EMPTY_RESPONSE, status=200)
-        responses.get(GENERAL_URL, json={"usageItems": []}, status=200)
-
+    def test_empty_items_yields_no_series(self) -> None:
+        responses.get(ENT_URL, json=EMPTY_RESPONSE, status=200)
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         metrics = _collect_as_dict(collector)
 
@@ -309,14 +315,14 @@ class TestEmptyUsageItems:
 class TestAuthFailure:
     @responses.activate
     def test_401_sets_scrape_success_to_zero(self) -> None:
-        responses.get(PREMIUM_URL, json={"message": "Bad credentials"}, status=401)
+        responses.get(ENT_URL, json={"message": "Bad credentials"}, status=401)
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         metrics = _collect_as_dict(collector)
         assert metrics["github_premium_request_scrape_success"][0].value == 0.0
 
     @responses.activate
     def test_401_increments_failure_counter(self) -> None:
-        responses.get(PREMIUM_URL, json={"message": "Bad credentials"}, status=401)
+        responses.get(ENT_URL, json={"message": "Bad credentials"}, status=401)
         registry = CollectorRegistry()
         collector = CopilotPremiumCollector(_config(), registry=registry)
         list(collector.collect())
@@ -326,7 +332,7 @@ class TestAuthFailure:
 
     @responses.activate
     def test_403_also_fails(self) -> None:
-        responses.get(PREMIUM_URL, json={"message": "Forbidden"}, status=403)
+        responses.get(ENT_URL, json={"message": "Forbidden"}, status=403)
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         metrics = _collect_as_dict(collector)
         assert metrics["github_premium_request_scrape_success"][0].value == 0.0
@@ -335,9 +341,23 @@ class TestAuthFailure:
 class TestNotFound:
     @responses.activate
     def test_404_does_not_crash(self) -> None:
-        responses.get(PREMIUM_URL, json={"message": "Not Found"}, status=404)
+        responses.get(ENT_URL, json={"message": "Not Found"}, status=404)
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         metrics = _collect_as_dict(collector)
 
         assert "github_premium_request_usage_gross_quantity" in metrics
         assert len(metrics["github_premium_request_usage_gross_quantity"]) == 0
+
+
+class TestQueryParams:
+    @responses.activate
+    def test_passes_year_and_month(self) -> None:
+        """Verify the API call includes year and month query params."""
+        responses.get(ENT_URL, json=SAMPLE_RESPONSE, status=200)
+        collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
+        list(collector.collect())
+
+        assert len(responses.calls) == 1
+        url = responses.calls[0].request.url
+        assert "year=" in url
+        assert "month=" in url

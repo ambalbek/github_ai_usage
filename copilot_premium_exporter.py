@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,14 +37,10 @@ USAGE_METRICS: dict[str, str] = {
     "github_premium_request_usage_price_per_unit": "pricePerUnit",
 }
 
-# Fallback endpoint (general /settings/billing/usage) uses different keys.
-GENERAL_USAGE_FIELD_MAP: dict[str, str] = {
-    "github_premium_request_usage_gross_quantity": "quantity",
-    "github_premium_request_usage_net_quantity": "quantity",
-    "github_premium_request_usage_gross_amount": "grossAmount",
-    "github_premium_request_usage_net_amount": "netAmount",
-    "github_premium_request_usage_discount_amount": "discountAmount",
-    "github_premium_request_usage_price_per_unit": "pricePerUnit",
+# Fields that should be summed when aggregating multiple items for the same model.
+SUMMABLE_FIELDS = {
+    "grossQuantity", "netQuantity", "discountQuantity",
+    "grossAmount", "netAmount", "discountAmount",
 }
 
 LABEL_NAMES = ["type", "name", "product", "sku", "model", "unit", "year", "month"]
@@ -116,6 +113,35 @@ class CacheEntry:
     expires_at: float
 
 
+def _aggregate_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Aggregate usageItems by (product, sku, model, unitType).
+
+    The GitHub API may return multiple entries for the same model (e.g. one per
+    day or per org within an enterprise). The UI shows the sum, so we must
+    aggregate to match. Summable fields (quantities, amounts) are added up;
+    pricePerUnit is kept from the last entry (it's the same across entries).
+    """
+    buckets: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+
+    for item in items:
+        key = (
+            item.get("product", ""),
+            item.get("sku", ""),
+            item.get("model", ""),
+            item.get("unitType", ""),
+        )
+        if key not in buckets:
+            buckets[key] = dict(item)  # shallow copy of first entry
+        else:
+            existing = buckets[key]
+            for field in SUMMABLE_FIELDS:
+                existing[field] = existing.get(field, 0) + item.get(field, 0)
+            # pricePerUnit is constant per model — keep latest
+            existing["pricePerUnit"] = item.get("pricePerUnit", existing.get("pricePerUnit", 0))
+
+    return list(buckets.values())
+
+
 class CopilotPremiumCollector:
     """Custom Prometheus collector for GitHub Copilot billing data."""
 
@@ -147,7 +173,6 @@ class CopilotPremiumCollector:
         session = requests.Session()
         session.headers.update(
             {
-                # Fix: GitHub's documented Accept header is vnd.github+json.
                 "Accept": "application/vnd.github+json",
                 "Authorization": f"Bearer {self._config.token}",
                 "X-GitHub-Api-Version": self._config.api_version,
@@ -163,23 +188,17 @@ class CopilotPremiumCollector:
         session.mount("https://", HTTPAdapter(max_retries=retry))
         return session
 
-    def _endpoint(self, kind: str) -> str:
-        """Build the API URL. kind is 'premium_request' or 'general'."""
+    def _endpoint(self) -> str:
+        """Build the premium_request billing API URL."""
         base = self._config.api_base
         scope = "enterprises" if self._config.entity_type == "enterprise" else "organizations"
         name = self._config.entity_name
-        if kind == "premium_request":
-            return f"{base}/{scope}/{name}/settings/billing/premium_request/usage"
-        return f"{base}/{scope}/{name}/settings/billing/usage"
+        return f"{base}/{scope}/{name}/settings/billing/premium_request/usage"
 
-    def _get(self, url: str) -> dict[str, Any] | None:
-        """GET a URL; return parsed JSON on 200, None on any failure.
-
-        No query params — the endpoint is undocumented for year/month and
-        passing them empirically causes empty responses.
-        """
+    def _get(self, url: str, params: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        """GET a URL; return parsed JSON on 200, None on any failure."""
         try:
-            resp = self._session.get(url, timeout=self._config.http_timeout)
+            resp = self._session.get(url, params=params, timeout=self._config.http_timeout)
         except requests.RequestException as exc:
             logger.error("HTTP error on %s: %s", url, exc)
             self._scrape_failures.inc()
@@ -193,14 +212,14 @@ class CopilotPremiumCollector:
         if resp.status_code in (401, 403):
             logger.error(
                 "Auth failed (%d) for %s — token needs "
-                "manage_billing:enterprise (classic) or Billing:Read (fine-grained). Body: %s",
+                "manage_billing:copilot + read:enterprise (classic) "
+                "or Billing: read (fine-grained). Body: %s",
                 resp.status_code, url, body,
             )
         elif resp.status_code == 404:
             logger.error(
-                "404 for %s — wrong scope (org vs enterprise slug) or "
-                "entity not on Enhanced Billing Platform. Body: %s",
-                url, body,
+                "404 for %s — entity not on Enhanced Billing Platform "
+                "or wrong slug. Body: %s", url, body,
             )
         elif resp.status_code == 429 or resp.headers.get("X-RateLimit-Remaining") == "0":
             logger.warning(
@@ -212,10 +231,11 @@ class CopilotPremiumCollector:
         return None
 
     def _fetch(self) -> CacheEntry | None:
-        """Return cached or freshly-fetched usage. Tries premium_request first,
-        falls back to general /settings/billing/usage if that returns nothing.
-        Post-June-2026 AI Credits data may live in either endpoint depending
-        on plan migration state.
+        """Return cached or freshly-fetched usage for the current month.
+
+        Passes year and month query params to match what the GitHub billing
+        UI shows. Items for the same model are aggregated (summed) because
+        the API may return multiple rows per model.
         """
         now = time.monotonic()
         with self._cache_lock:
@@ -223,49 +243,40 @@ class CopilotPremiumCollector:
                 return self._cache
 
         utc_now = datetime.now(timezone.utc)
-        default_year = str(utc_now.year)
-        default_month = str(utc_now.month)
+        year = utc_now.year
+        month = utc_now.month
 
-        items: list[dict[str, Any]] = []
-        year, month = default_year, default_month
+        data = self._get(self._endpoint(), params={"year": year, "month": month})
+        if data is None:
+            return None
 
-        # Primary: premium_request endpoint (has the `model` field).
-        data = self._get(self._endpoint("premium_request"))
-        if data:
-            tp = data.get("timePeriod", {}) or {}
-            year = str(tp.get("year", default_year))
-            month = str(tp.get("month", default_month))
-            items = data.get("usageItems", []) or []
-            logger.info(
-                "premium_request endpoint returned %d items for %s/%s",
-                len(items), self._config.entity_type, self._config.entity_name,
-            )
+        tp = data.get("timePeriod", {}) or {}
+        resp_year = str(tp.get("year", year))
+        resp_month = str(tp.get("month", month))
 
-        # Fallback: general usage endpoint (no `model` field, but at least gets Copilot SKU spend).
-        if not items:
-            logger.info("Falling back to general /settings/billing/usage endpoint")
-            data = self._get(self._endpoint("general"))
-            if data:
-                all_items = data.get("usageItems", []) or []
-                items = [
-                    {**i, "model": ""}  # general endpoint has no model field
-                    for i in all_items
-                    if (i.get("product") or "").lower() == "copilot"
-                ]
-                logger.info("general endpoint returned %d Copilot items", len(items))
+        raw_items = data.get("usageItems", []) or []
+        items = _aggregate_items(raw_items)
 
-        if data is None and not items:
-            return None  # complete failure — don't poison the cache
+        logger.info(
+            "Fetched %d raw items, aggregated to %d for %s/%s (period %s-%s)",
+            len(raw_items), len(items),
+            self._config.entity_type, self._config.entity_name,
+            resp_year, resp_month,
+        )
 
         entry = CacheEntry(
             items=items,
-            year=year,
-            month=month,
+            year=resp_year,
+            month=resp_month,
             expires_at=time.monotonic() + self._config.cache_ttl,
         )
         with self._cache_lock:
             self._cache = entry
         return entry
+
+    def describe(self) -> list[GaugeMetricFamily]:
+        """Return empty metric families — avoids a collect() call at startup."""
+        return [GaugeMetricFamily(name, "", labels=LABEL_NAMES) for name in USAGE_METRICS]
 
     def collect(self) -> Iterable[GaugeMetricFamily]:
         start = time.monotonic()
@@ -279,8 +290,6 @@ class CopilotPremiumCollector:
 
         if entry is not None:
             for item in entry.items:
-                # Premium-request schema has separate gross/net quantities;
-                # general schema has only "quantity". Use a per-metric fallback.
                 label_values = [
                     self._config.entity_type,
                     self._config.entity_name,
@@ -292,18 +301,14 @@ class CopilotPremiumCollector:
                     entry.month,
                 ]
                 for metric_name, json_key in USAGE_METRICS.items():
-                    value = item.get(json_key)
-                    if value is None:
-                        # General endpoint fallback for missing keys.
-                        fallback_key = GENERAL_USAGE_FIELD_MAP.get(metric_name)
-                        value = item.get(fallback_key, 0) if fallback_key else 0
+                    value = item.get(json_key, 0)
                     families[metric_name].add_metric(label_values, float(value or 0))
 
         yield from families.values()
 
         success = GaugeMetricFamily(
             "github_premium_request_scrape_success",
-            "1 if last scrape succeeded and returned any items, else 0",
+            "1 if last scrape succeeded and returned items, else 0",
         )
         success.add_metric([], 1.0 if entry and entry.items else 0.0)
         yield success
