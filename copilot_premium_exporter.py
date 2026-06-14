@@ -178,7 +178,12 @@ class CopilotPremiumCollector:
 
     def _endpoint(self, etype: str, name: str, kind: str) -> str:
         scope = "enterprises" if etype == "enterprise" else "organizations"
-        suffix = "premium_request/usage" if kind == "premium_request" else "usage"
+        suffix_map = {
+            "ai_credit": "ai_credit/usage",
+            "premium_request": "premium_request/usage",
+            "usage": "usage",
+        }
+        suffix = suffix_map[kind]
         return f"{self._config.api_base}/{scope}/{name}/settings/billing/{suffix}"
 
     def _get(self, url: str) -> dict[str, Any] | None:
@@ -236,16 +241,33 @@ class CopilotPremiumCollector:
         return out
 
     def _fetch_entity(self, etype: str, name: str) -> tuple[list[dict[str, Any]], bool]:
-        """Fetch one entity. Returns (tagged_items, http_ok).
+        """Fetch ALL billing data for one entity. Returns (tagged_items, http_ok).
 
-        http_ok is True if at least one endpoint responded 200 (even if empty),
-        so a genuinely-zero-usage period is not treated as a failure.
+        Calls all three endpoints and merges results so nothing is missed:
+        1. ai_credit/usage — new usage-based billing (June 2026+)
+        2. premium_request/usage — legacy request-based billing
+        3. usage — general billing (filtered to Copilot, seat licenses excluded)
+
+        http_ok is True if at least one endpoint responded 200.
         """
         now = datetime.now(timezone.utc)
         d_year, d_month = str(now.year), str(now.month)
         ok = False
+        all_items: list[dict[str, Any]] = []
 
-        # Primary: premium_request (has the model field; no seat licenses).
+        # 1. AI Credits (new billing model since June 2026).
+        data = self._get(self._endpoint(etype, name, "ai_credit"))
+        if data is not None:
+            ok = True
+            tp = data.get("timePeriod", {}) or {}
+            year = str(tp.get("year", d_year))
+            month = str(tp.get("month", d_month))
+            items = data.get("usageItems", []) or []
+            if items:
+                logger.info("%s/%s ai_credit -> %d items", etype, name, len(items))
+                all_items.extend(self._tag(items, etype, name, year, month))
+
+        # 2. Premium Request (legacy, for annual plans not yet migrated).
         data = self._get(self._endpoint(etype, name, "premium_request"))
         if data is not None:
             ok = True
@@ -255,25 +277,57 @@ class CopilotPremiumCollector:
             items = data.get("usageItems", []) or []
             if items:
                 logger.info("%s/%s premium_request -> %d items", etype, name, len(items))
-                return self._tag(items, etype, name, year, month), ok
+                all_items.extend(self._tag(items, etype, name, year, month))
 
-        # Fallback: general usage, filtered to AI SKUs (drop seat licenses).
-        logger.info("%s/%s premium_request empty -> general usage fallback", etype, name)
-        data = self._get(self._endpoint(etype, name, "usage"))
-        if data is not None:
-            ok = True
-            all_items = data.get("usageItems", []) or []
-            filtered = [
-                it for it in all_items
-                if (it.get("product") or "").lower() == "copilot"
-                and (it.get("sku") or "").strip().lower() not in self._config.exclude_skus
-            ]
-            dropped = len(all_items) - len(filtered)
-            logger.info("%s/%s general -> %d Copilot AI items (%d seat-license rows excluded)",
-                        etype, name, len(filtered), dropped)
-            return self._tag(filtered, etype, name, d_year, d_month), ok
+        # 3. General usage, filtered to Copilot AI SKUs (drop seat licenses).
+        if not all_items:
+            data = self._get(self._endpoint(etype, name, "usage"))
+            if data is not None:
+                ok = True
+                raw_items = data.get("usageItems", []) or []
+                filtered = [
+                    it for it in raw_items
+                    if (it.get("product") or "").lower() == "copilot"
+                    and (it.get("sku") or "").strip().lower() not in self._config.exclude_skus
+                ]
+                if filtered:
+                    logger.info("%s/%s general -> %d Copilot AI items", etype, name, len(filtered))
+                    all_items.extend(self._tag(filtered, etype, name, d_year, d_month))
 
-        return [], ok
+        # Deduplicate: if ai_credit and premium_request return overlapping data,
+        # keep unique entries by (model, sku, product, unitType). Sum amounts.
+        deduped = self._deduplicate(all_items)
+        return deduped, ok
+
+    def _deduplicate(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Merge items with the same (model, sku, product, unitType, _year, _month).
+
+        Sums quantity/amount fields; keeps pricePerUnit from any entry.
+        """
+        buckets: dict[tuple, dict[str, Any]] = {}
+        summable = {"grossQuantity", "netQuantity", "discountQuantity",
+                    "grossAmount", "netAmount", "discountAmount", "quantity"}
+
+        for item in items:
+            key = (
+                item.get("model", ""),
+                item.get("sku", ""),
+                item.get("product", ""),
+                item.get("unitType", ""),
+                item.get("_year", ""),
+                item.get("_month", ""),
+            )
+            if key not in buckets:
+                buckets[key] = dict(item)
+            else:
+                existing = buckets[key]
+                for f in summable:
+                    if f in item:
+                        existing[f] = existing.get(f, 0) + item.get(f, 0)
+                if "pricePerUnit" in item:
+                    existing["pricePerUnit"] = item["pricePerUnit"]
+
+        return list(buckets.values())
 
     def _fetch(self) -> CacheEntry:
         now = time.monotonic()
