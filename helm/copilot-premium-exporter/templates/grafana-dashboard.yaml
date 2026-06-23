@@ -1,0 +1,12 @@
+{{- if .Values.grafanaDashboard.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "copilot-premium-exporter.fullname" . }}-dashboard
+  labels:
+    {{- include "copilot-premium-exporter.labels" . | nindent 4 }}
+    {{ .Values.grafanaDashboard.sidecarLabel }}: {{ .Values.grafanaDashboard.sidecarLabelValue | quote }}
+data:
+  copilot-premium.json: |-
+    {{- .Files.Get "dashboards/copilot-premium.json" | nindent 4 }}
+{{- end }}

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: copilot-premium-exporter
+description: Prometheus exporter for GitHub Copilot AI Credits / Premium Request billing
+version: 1.0.0
+appVersion: "2.0"
+type: application

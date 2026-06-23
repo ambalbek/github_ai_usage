@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "copilot-premium-exporter.fullname" . }}
+  labels:
+    {{- include "copilot-premium-exporter.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "copilot-premium-exporter.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.service.port }}
+      targetPort: metrics
+      protocol: TCP
