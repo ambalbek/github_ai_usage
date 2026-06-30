@@ -1,0 +1,26 @@
+image:
+  repository: copilot-premium-exporter
+  tag: latest
+  pullPolicy: Never
+
+existingSecret: "github-token"
+
+config:
+  github_organizations:
+    - "ambalbek"
+  github_enterprises: []
+  exclude_skus:
+    - "Copilot Business"
+    - "Copilot Enterprise"
+  cache_ttl_seconds: 900
+  http_timeout_seconds: 30
+  exporter_port: 9185
+  exporter_host: "0.0.0.0"
+  log_level: "INFO"
+  api_version: "2022-11-28"
+
+serviceMonitor:
+  enabled: false
+
+grafanaDashboard:
+  enabled: false

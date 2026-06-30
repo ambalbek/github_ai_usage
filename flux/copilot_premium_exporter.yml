@@ -38,15 +38,11 @@ spec:
       log_level: "INFO"
       api_version: "2022-11-28"
 
-    # --- Corporate Prometheus integration ---
-    # additionalLabels MUST match your Prometheus Operator's serviceMonitorSelector
-    # Find yours: kubectl get prometheus -A -o jsonpath='{.items[*].spec.serviceMonitorSelector}'
     serviceMonitor:
       enabled: true
       interval: 60s
       scrapeTimeout: 30s
-      additionalLabels:
-        release: kube-prometheus-stack  # ← change to match your corporate Prometheus
+      additionalLabels: {}
 
     # --- Corporate Grafana integration ---
     # sidecarLabel MUST match your Grafana sidecar's LABEL_SELECTOR env var
