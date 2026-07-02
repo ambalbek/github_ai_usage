@@ -1,4 +1,4 @@
-apiVersion: helm.toolkit.fluxcd.io/v2beta2
+apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
 metadata:
   name: copilot-premium-exporter
@@ -22,7 +22,7 @@ spec:
       pullPolicy: IfNotPresent
 
     # Use externally managed secret for GITHUB_TOKEN
-    existingSecret: "GITHUB_TOKEN"
+    existingSecret: "github-token"
 
     config:
       github_organizations:
@@ -39,7 +39,7 @@ spec:
       api_version: "2022-11-28"
 
     serviceMonitor:
-      enabled: true
+      enabled: false
       interval: 60s
       scrapeTimeout: 30s
       additionalLabels: {}
