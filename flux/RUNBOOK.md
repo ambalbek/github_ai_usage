@@ -7,14 +7,27 @@
 
 ## Steps
 
-### 1. Create namespaces
+### 1. Build and push the Docker image
+
+```bash
+# Login to ACR
+az acr login --name <YOUR_ACR_NAME>
+
+# Build and push
+docker build -t <YOUR_ACR_NAME>.azurecr.io/copilot-premium-exporter:latest .
+docker push <YOUR_ACR_NAME>.azurecr.io/copilot-premium-exporter:latest
+```
+
+> **Note:** Update `image.repository` in `flux/copilot_premium_exporter.yml` to match your ACR name.
+
+### 2. Create namespaces
 
 ```bash
 kubectl create namespace monitoring
 kubectl create namespace flux-system  # usually exists after bootstrap
 ```
 
-### 2. Create secrets
+### 3. Create secrets
 
 Git repo credentials (for Flux to pull the chart):
 
@@ -34,20 +47,20 @@ kubectl create secret generic github-token \
   --from-literal=GITHUB_TOKEN=<GITHUB_PAT>
 ```
 
-### 3. Apply Flux manifests
+### 4. Apply Flux manifests
 
 ```bash
 kubectl apply -k flux/
 ```
 
-### 4. Reconcile
+### 5. Reconcile
 
 ```bash
 flux reconcile source git copilot-premium-exporter
 flux reconcile helmrelease copilot-premium-exporter -n monitoring
 ```
 
-### 5. Verify
+### 6. Verify
 
 ```bash
 flux get sources git
@@ -55,7 +68,7 @@ flux get helmreleases -n monitoring
 kubectl get pods -n monitoring -l app.kubernetes.io/name=copilot-premium-exporter
 ```
 
-### 6. Test metrics
+### 7. Test metrics
 
 ```bash
 kubectl port-forward -n monitoring svc/copilot-premium-exporter 9185:9185
