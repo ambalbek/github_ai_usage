@@ -75,21 +75,85 @@ kubectl port-forward -n monitoring svc/copilot-premium-exporter 9185:9185
 curl http://localhost:9185/metrics
 ```
 
+## Validation
+
+### Run the validation script
+
+```bash
+chmod +x flux/validate.sh
+./flux/validate.sh
+```
+
+### Validate kustomization
+
+```bash
+# Render kustomize output (catches missing resource files, bad references)
+kubectl kustomize flux/
+# or
+kustomize build flux/
+```
+
+### Validate Helm chart
+
+```bash
+# Lint the chart
+helm lint ./helm/copilot-premium-exporter \
+  -f ./helm/copilot-premium-exporter/values-local.yaml
+
+# Dry-run template render
+helm template cpe ./helm/copilot-premium-exporter \
+  -f ./helm/copilot-premium-exporter/values-local.yaml
+
+# Dry-run install against the cluster
+helm install cpe ./helm/copilot-premium-exporter \
+  -f ./helm/copilot-premium-exporter/values-local.yaml \
+  -n monitoring --dry-run
+```
+
+### Validate Flux manifests (CI)
+
+```bash
+# Validate GitRepository and HelmRelease YAML
+kubectl apply --dry-run=client -f flux/git-repository.yaml
+kubectl apply --dry-run=client -f flux/copilot_premium_exporter.yml
+```
+
+## Flux Status Commands
+
+```bash
+# Overall Flux health
+flux check
+
+# All Flux resources at a glance
+flux get all -A
+
+# GitRepository source status
+flux get sources git
+
+# HelmRelease status
+flux get helmreleases -n monitoring
+
+# Kustomization status (if using Flux Kustomization)
+flux get kustomizations -A
+```
+
 ## Troubleshooting
 
-Check HelmRelease status:
+### Check status and events
 
 ```bash
-flux get helmreleases -n monitoring
+# HelmRelease details and events
+kubectl describe helmrelease copilot-premium-exporter -n monitoring
+
+# GitRepository details and events
+kubectl describe gitrepository copilot-premium-exporter -n flux-system
+
+# Pod events and logs
+kubectl describe pod -n monitoring -l app.kubernetes.io/name=copilot-premium-exporter
+kubectl logs -n monitoring -l app.kubernetes.io/name=copilot-premium-exporter --tail=100
 ```
 
-Check GitRepository source:
-
-```bash
-flux get sources git
-```
-
-Force re-fetch after pushing changes:
+### Force re-fetch after pushing changes
 
 ```bash
 flux suspend helmrelease copilot-premium-exporter -n monitoring
@@ -98,19 +162,57 @@ flux reconcile source git copilot-premium-exporter
 flux reconcile helmrelease copilot-premium-exporter -n monitoring
 ```
 
-View Helm release events:
+### Secrets management
 
 ```bash
-kubectl describe helmrelease copilot-premium-exporter -n monitoring
-```
+# List secrets
+kubectl get secrets -n monitoring
+kubectl get secrets -n flux-system
 
-Delete and recreate a secret:
+# Inspect a secret (base64 encoded)
+kubectl get secret github-token -n monitoring -o yaml
 
-```bash
+# Delete and recreate a secret
 kubectl delete secret github-token -n monitoring
 kubectl create secret generic github-token \
   --namespace monitoring \
   --from-literal=GITHUB_TOKEN=<GITHUB_PAT>
+
+# Recreate git credentials
+flux create secret git github-repo-creds \
+  --namespace flux-system \
+  --url=https://github.com/ambalbek/github_ai_usage.git \
+  --username=git \
+  --password=<GITHUB_PAT>
+```
+
+### Helm release management
+
+```bash
+# List Helm releases
+helm list -n monitoring
+
+# Check Helm release history
+helm history copilot-premium-exporter -n monitoring
+
+# Rollback to previous revision
+helm rollback copilot-premium-exporter <REVISION> -n monitoring
+
+# Uninstall
+helm uninstall copilot-premium-exporter -n monitoring
+```
+
+### Cleanup / full uninstall
+
+```bash
+# Remove Flux resources
+kubectl delete -k flux/
+
+# Remove the namespace
+kubectl delete namespace monitoring
+
+# Remove git credentials
+kubectl delete secret github-repo-creds -n flux-system
 ```
 
 ## Known Gotchas
@@ -119,3 +221,5 @@ kubectl create secret generic github-token \
 - **Secret names**: must be lowercase RFC 1123 (`github-token`, not `GITHUB_TOKEN`)
 - **ServiceMonitor**: disable if Prometheus Operator CRDs aren't installed
 - **All changes must be pushed** — Flux reads from the remote repo, not local files
+- **Cached charts**: if Flux doesn't pick up changes, suspend/resume the HelmRelease
+- **CRDs must exist first**: if using ServiceMonitor or other custom resources, install CRDs before deploying
