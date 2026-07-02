@@ -5,7 +5,7 @@ metadata:
   namespace: flux-system
 spec:
   interval: 5m
-  url: https://github.com/YOUR_ORG/github_ai_usage.git
+  url: https://github.com/ambalbek/github_ai_usage.git
   ref:
     branch: main
   secretRef:
