@@ -1,0 +1,22 @@
+name: "Flux Validation"
+
+on:
+  pull_request:
+    paths:
+      - "flux/**"
+      - "helm/**"
+
+jobs:
+  flux-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Setup Flux CLI
+        uses: fluxcd/flux2/action@v2.2.2
+
+      - name: Validate Flux manifests
+        uses: docker://ghcr.io/home-operations/flate:latest
+        with:
+          args: test all --path /github/workspace/flux/ --allow-missing-secrets --no-progress

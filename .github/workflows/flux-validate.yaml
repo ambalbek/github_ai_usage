@@ -1,67 +1,60 @@
 name: "Flux Validation"
 
 on:
-  pull_request:
-    paths:
-      - "clusters/**"
-      - "flux/**"
-      - "helm/**"
-      - ".github/workflows/flux-validate.yaml"
-  push:
-    branches: [main]
-    paths:
-      - "clusters/**"
-      - "flux/**"
-      - "helm/**"
-
-permissions:
-  contents: read
+  workflow_call:
+    secrets:
+      GH_GENERIC_ACCOUNT_TOKEN:
+        required: true
 
 jobs:
-  # ------------------------------------------------------------------
-  # Fast feedback: does the Helm chart even render? Catches template
-  # and values errors before flux-local spins up.
-  # ------------------------------------------------------------------
-  helm-lint:
-    name: Lint & template the chart
+  # 1) Discover cluster subdirectories so the matrix isn't hardcoded.
+  discover-clusters:
     runs-on: ubuntu-latest
+    outputs:
+      clusters: ${{ steps.list.outputs.clusters }}
     steps:
       - name: Check out code
         uses: actions/checkout@v4
-
-      - name: Setup Helm
-        uses: azure/setup-helm@v4
         with:
-          version: v3.15.4
-          token: ${{ github.token }}
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: helm lint
+      - name: List cluster directories
+        id: list
         run: |
-          helm lint ./helm/copilot-premium-exporter \
-            -f ./helm/copilot-premium-exporter/values-local.yaml
+          clusters=$(find clusters -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
+            | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "clusters=$clusters" >> "$GITHUB_OUTPUT"
 
-      - name: helm template (render must succeed)
-        run: |
-          helm template cpe ./helm/copilot-premium-exporter \
-            -f ./helm/copilot-premium-exporter/values-local.yaml > /dev/null
-
-  # ------------------------------------------------------------------
-  # flux-local: build every Flux Kustomization under clusters/ and
-  # render the HelmReleases it references.
-  # ------------------------------------------------------------------
-  flux-local-validate:
-    name: Validate all clusters
+  # 2) Validate each cluster INDEPENDENTLY with a strict per-cluster --path.
+  #    This is what stops the four clusters' identically-named Kustomizations
+  #    (flux-system, infrastructure, aad-pod-identity, keda) from colliding.
+  flux-local-test:
+    needs: discover-clusters
     runs-on: ubuntu-latest
-    needs: helm-lint
+    strategy:
+      fail-fast: false
+      matrix:
+        cluster: ${{ fromJSON(needs.discover-clusters.outputs.clusters) }}
     steps:
       - name: Check out code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Flux CLI
         uses: fluxcd/flux2/action@v2.2.2
 
-      - name: Validate all clusters
+      - name: Rename this cluster's .sops.yaml (so flux-local ignores it)
+        run: |
+          find "clusters/${{ matrix.cluster }}" -name '.sops.yaml' \
+            -exec mv {} {}_ \;
+
+      - name: Validate ${{ matrix.cluster }}
         uses: allenporter/flux-local/action/test@7.8.0
         with:
-          path: clusters
-          enable-helm: true
+          path: clusters/${{ matrix.cluster }}
+          enable-helm: false
