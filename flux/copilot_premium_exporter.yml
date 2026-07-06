@@ -9,10 +9,10 @@ spec:
   releaseName: copilot-premium-exporter
   chart:
     spec:
-      chart: helm/copilot-premium-exporter
+      chart: infrastructure/clusterA/copilot-premium-exporter/helm/copilot-premium-exporter
       sourceRef:
         kind: GitRepository
-        name: copilot-premium-exporter
+        name: gitops_flux
         namespace: flux-system
       interval: 5m
   values:
