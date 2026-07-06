@@ -1,24 +1,17 @@
 replicaCount: 1
 
 image:
-  repository: YOUR_ACR_NAME.azurecr.io/copilot-premium-exporter
+  repository: ""
   tag: latest
   pullPolicy: Always
 
-# GitHub token — provide via --set or external secret
 githubToken: ""
-
-# Alternatively, reference an existing secret containing GITHUB_TOKEN key
 existingSecret: ""
 
 config:
-  github_organizations:
-    - "your-org-1"
-    - "your-org-2"
+  github_organizations: []
   github_enterprises: []
-  exclude_skus:
-    - "Copilot Business"
-    - "Copilot Enterprise"
+  exclude_skus: []
   cache_ttl_seconds: 900
   http_timeout_seconds: 30
   exporter_port: 9185
@@ -30,25 +23,4 @@ service:
   type: ClusterIP
   port: 9185
 
-resources:
-  requests:
-    cpu: 50m
-    memory: 64Mi
-  limits:
-    cpu: 200m
-    memory: 128Mi
-
-serviceMonitor:
-  enabled: true
-  interval: 60s
-  scrapeTimeout: 30s
-  # Additional labels to match your Prometheus Operator's serviceMonitorSelector.
-  # For kube-prometheus-stack default: release: kube-prometheus-stack
-  additionalLabels:
-    release: kube-prometheus-stack
-
-grafanaDashboard:
-  enabled: true
-  # Label that Grafana sidecar watches for
-  sidecarLabel: grafana_dashboard
-  sidecarLabelValue: "1"
+resources: {}
