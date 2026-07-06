@@ -7,6 +7,6 @@ spec:
   interval: 5m
   url: https://github.com/ambalbek/github_ai_usage.git
   ref:
-    branch: feature
+    branch: main
   secretRef:
     name: github-repo-creds  # remove if repo is public

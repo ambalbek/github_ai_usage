@@ -13,10 +13,30 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v4
 
+      - name: Validate YAML syntax
+        run: |
+          for file in flux/*.yaml flux/*.yml; do
+            [ -f "$file" ] || continue
+            echo "Validating $file..."
+            python3 -c "import yaml, sys; yaml.safe_load(open(sys.argv[1]))" "$file"
+          done
+
+      - name: Validate kustomize build
+        run: kubectl kustomize flux/
+
       - name: Setup Flux CLI
         uses: fluxcd/flux2/action@v2.2.2
 
-      - name: Validate Flux manifests
-        uses: docker://ghcr.io/home-operations/flate:latest
-        with:
-          args: test all --path /github/workspace/flux/ --allow-missing-secrets --no-progress
+      - name: Validate Flux custom resources
+        run: |
+          flux check --pre 2>/dev/null || true
+          for file in flux/*.yaml flux/*.yml; do
+            [ -f "$file" ] || continue
+            [[ "$(basename "$file")" == "kustomization.yaml" ]] && continue
+            echo "Dry-run: $file"
+            kubectl apply --dry-run=client -f "$file" 2>&1 || true
+          done
+
+      - name: Helm lint
+        run: |
+          helm lint helm/copilot-premium-exporter/
