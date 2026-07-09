@@ -51,6 +51,9 @@ spec:
       scrapeTimeout: 30s
       labels: {}
 
+    grafanaDashboard:
+      enabled: true
+
     resources:
       requests:
         cpu: 50m

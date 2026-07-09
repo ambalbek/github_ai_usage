@@ -29,4 +29,7 @@ serviceMonitor:
   scrapeTimeout: 30s
   labels: {}
 
+grafanaDashboard:
+  enabled: false
+
 resources: {}
