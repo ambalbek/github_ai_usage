@@ -5,24 +5,31 @@ metadata:
   namespace: monitoring
 spec:
   interval: 10m
-  timeout: 5m
+  timeout: 15m
+  install:
+    disableWait: true
+  upgrade:
+    disableWait: true
   releaseName: copilot-premium-exporter
   chart:
     spec:
-      chart: infrastructure/clusterA/copilot-premium-exporter/helm/copilot-premium-exporter
+      chart: helm
       sourceRef:
         kind: GitRepository
-        name: gitops_flux
+        name: copilot-premium-exporter
         namespace: flux-system
       interval: 5m
   values:
     image:
-      repository: YOUR_ACR_NAME.azurecr.io/copilot-premium-exporter
+      repository: ghcr.io/<owner>/copilot-premium-exporter
       tag: latest
       pullPolicy: IfNotPresent
 
     # Use externally managed secret for GITHUB_TOKEN
     existingSecret: "github-token"
+
+    imagePullSecrets:
+      - name: ghcr-secret
 
     config:
       github_organizations:
@@ -37,6 +44,12 @@ spec:
       exporter_host: "0.0.0.0"
       log_level: "INFO"
       api_version: "2022-11-28"
+
+    serviceMonitor:
+      enabled: true
+      interval: 60s
+      scrapeTimeout: 30s
+      labels: {}
 
     resources:
       requests:

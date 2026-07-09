@@ -14,8 +14,15 @@ spec:
       labels:
         {{- include "copilot-premium-exporter.selectorLabels" . | nindent 8 }}
       annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9185"
+        prometheus.io/path: "/metrics"
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000

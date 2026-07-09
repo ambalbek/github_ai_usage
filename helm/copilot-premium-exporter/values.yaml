@@ -23,4 +23,10 @@ service:
   type: ClusterIP
   port: 9185
 
+serviceMonitor:
+  enabled: false
+  interval: 60s
+  scrapeTimeout: 30s
+  labels: {}
+
 resources: {}
