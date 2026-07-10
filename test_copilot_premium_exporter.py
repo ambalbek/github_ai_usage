@@ -57,6 +57,7 @@ def _config(**overrides: object) -> ExporterConfig:
         organizations=[],
         cache_ttl=900,
         http_timeout=5,
+        months_back=0,
     )
     defaults.update(overrides)
     return ExporterConfig(**defaults)  # type: ignore[arg-type]
@@ -313,6 +314,73 @@ class TestEmptyUsageItems:
         assert len(metrics["github_premium_request_usage_gross_quantity"]) == 0
         # Still success=1 because the API responded OK, just no usage
         assert metrics["github_premium_request_scrape_success"][0].value == 1.0
+
+
+class TestMultiMonth:
+    @responses.activate
+    def test_fetches_current_and_previous_month(self) -> None:
+        """With months_back=1, fetches both current and previous month."""
+        current_resp = {
+            "timePeriod": {"year": 2026, "month": 7},
+            "usageItems": [
+                {"product": "Copilot", "sku": "Copilot AI Credits", "model": "GPT-5",
+                 "unitType": "ai-credits", "pricePerUnit": 0.01,
+                 "grossQuantity": 200, "grossAmount": 2.0,
+                 "discountQuantity": 0, "discountAmount": 0.0,
+                 "netQuantity": 200, "netAmount": 2.0},
+            ],
+        }
+        previous_resp = {
+            "timePeriod": {"year": 2026, "month": 6},
+            "usageItems": [
+                {"product": "Copilot", "sku": "Copilot AI Credits", "model": "GPT-5",
+                 "unitType": "ai-credits", "pricePerUnit": 0.01,
+                 "grossQuantity": 400, "grossAmount": 4.0,
+                 "discountQuantity": 0, "discountAmount": 0.0,
+                 "netQuantity": 400, "netAmount": 4.0},
+            ],
+        }
+        # responses library matches URL regardless of query params;
+        # use callbacks to return different data based on month param.
+        def ai_credit_callback(request):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(request.url).query)
+            month = qs.get("month", [""])[0]
+            if month == "6":
+                return (200, {}, json.dumps(previous_resp))
+            return (200, {}, json.dumps(current_resp))
+
+        responses.add_callback(responses.GET, AI_CREDIT_URL, callback=ai_credit_callback)
+        responses.get(PREMIUM_URL, json=EMPTY_RESPONSE, status=200)
+
+        collector = CopilotPremiumCollector(
+            _config(months_back=1), registry=CollectorRegistry())
+        metrics = _collect_as_dict(collector)
+
+        gross = metrics["github_premium_request_usage_gross_quantity"]
+        # Two separate entries: one for month 7, one for month 6
+        assert len(gross) == 2
+        values = sorted([s.value for s in gross])
+        assert values == [200.0, 400.0]
+        months = sorted([s.labels["month"] for s in gross])
+        assert months == ["6", "7"]
+
+    def test_months_to_fetch_wraps_year(self) -> None:
+        """January with months_back=1 should return Jan + Dec of previous year."""
+        from unittest.mock import patch
+        from datetime import datetime as dt
+
+        with patch("copilot_premium_exporter.datetime") as mock_dt:
+            mock_dt.now.return_value = dt(2026, 1, 15)
+            mock_dt.side_effect = lambda *a, **kw: dt(*a, **kw)
+            months = CopilotPremiumCollector._months_to_fetch(1)
+            assert (2026, 1) in months
+            assert (2025, 12) in months
+
+    def test_months_to_fetch_zero(self) -> None:
+        """months_back=0 returns only current month."""
+        months = CopilotPremiumCollector._months_to_fetch(0)
+        assert len(months) == 1
 
 
 class TestExcludeSkus:

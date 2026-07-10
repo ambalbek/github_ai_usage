@@ -79,6 +79,7 @@ class ExporterConfig:
     http_timeout: int = 30
     port: int = 9185
     host: str = "0.0.0.0"
+    months_back: int = 1
     log_level: str = "INFO"
     api_version: str = "2022-11-28"
     api_base: str = "https://api.github.com"
@@ -120,6 +121,7 @@ class ExporterConfig:
             http_timeout=raw.get("http_timeout_seconds", 30),
             port=raw.get("exporter_port", 9185),
             host=raw.get("exporter_host", "0.0.0.0"),
+            months_back=raw.get("months_back", 1),
             log_level=raw.get("log_level", "INFO"),
             api_version=raw.get("api_version", "2022-11-28"),
             api_base=raw.get("api_base", "https://api.github.com").rstrip("/"),
@@ -186,7 +188,7 @@ class CopilotPremiumCollector:
         suffix = suffix_map[kind]
         return f"{self._config.api_base}/{scope}/{name}/settings/billing/{suffix}"
 
-    def _get(self, url: str) -> dict[str, Any] | None:
+    def _get(self, url: str, params: dict[str, str] | None = None) -> dict[str, Any] | None:
         """GET a billing URL; return parsed JSON on 200, else None.
 
         Times only the real HTTP call so the duration histogram reflects true
@@ -194,7 +196,7 @@ class CopilotPremiumCollector:
         """
         fetch_start = time.monotonic()
         try:
-            resp = self._session.get(url, timeout=self._config.http_timeout)
+            resp = self._session.get(url, params=params, timeout=self._config.http_timeout)
         except requests.RequestException as exc:
             self._scrape_duration.observe(time.monotonic() - fetch_start)
             logger.error("HTTP error on %s: %s", url, exc)
@@ -240,8 +242,11 @@ class CopilotPremiumCollector:
             out.append(tagged)
         return out
 
-    def _fetch_entity(self, etype: str, name: str) -> tuple[list[dict[str, Any]], bool]:
-        """Fetch ALL billing data for one entity. Returns (tagged_items, http_ok).
+    def _fetch_entity(self, etype: str, name: str,
+                      year: int, month: int) -> tuple[list[dict[str, Any]], bool]:
+        """Fetch billing data for one entity for a specific month.
+
+        Returns (tagged_items, http_ok).
 
         Calls all three endpoints and merges results so nothing is missed:
         1. ai_credit/usage — new usage-based billing (June 2026+)
@@ -250,38 +255,40 @@ class CopilotPremiumCollector:
 
         http_ok is True if at least one endpoint responded 200.
         """
-        now = datetime.now(timezone.utc)
-        d_year, d_month = str(now.year), str(now.month)
+        d_year, d_month = str(year), str(month)
+        params = {"year": d_year, "month": d_month}
         ok = False
         all_items: list[dict[str, Any]] = []
 
         # 1. AI Credits (new billing model since June 2026).
-        data = self._get(self._endpoint(etype, name, "ai_credit"))
+        data = self._get(self._endpoint(etype, name, "ai_credit"), params=params)
         if data is not None:
             ok = True
             tp = data.get("timePeriod", {}) or {}
-            year = str(tp.get("year", d_year))
-            month = str(tp.get("month", d_month))
+            r_year = str(tp.get("year", d_year))
+            r_month = str(tp.get("month", d_month))
             items = data.get("usageItems", []) or []
             if items:
-                logger.info("%s/%s ai_credit -> %d items", etype, name, len(items))
-                all_items.extend(self._tag(items, etype, name, year, month))
+                logger.info("%s/%s ai_credit %s-%s -> %d items",
+                            etype, name, d_year, d_month, len(items))
+                all_items.extend(self._tag(items, etype, name, r_year, r_month))
 
         # 2. Premium Request (legacy, for annual plans not yet migrated).
-        data = self._get(self._endpoint(etype, name, "premium_request"))
+        data = self._get(self._endpoint(etype, name, "premium_request"), params=params)
         if data is not None:
             ok = True
             tp = data.get("timePeriod", {}) or {}
-            year = str(tp.get("year", d_year))
-            month = str(tp.get("month", d_month))
+            r_year = str(tp.get("year", d_year))
+            r_month = str(tp.get("month", d_month))
             items = data.get("usageItems", []) or []
             if items:
-                logger.info("%s/%s premium_request -> %d items", etype, name, len(items))
-                all_items.extend(self._tag(items, etype, name, year, month))
+                logger.info("%s/%s premium_request %s-%s -> %d items",
+                            etype, name, d_year, d_month, len(items))
+                all_items.extend(self._tag(items, etype, name, r_year, r_month))
 
         # 3. General usage, filtered to Copilot AI SKUs (drop seat licenses).
         if not all_items:
-            data = self._get(self._endpoint(etype, name, "usage"))
+            data = self._get(self._endpoint(etype, name, "usage"), params=params)
             if data is not None:
                 ok = True
                 raw_items = data.get("usageItems", []) or []
@@ -291,7 +298,8 @@ class CopilotPremiumCollector:
                     and (it.get("sku") or "").strip().lower() not in self._config.exclude_skus
                 ]
                 if filtered:
-                    logger.info("%s/%s general -> %d Copilot AI items", etype, name, len(filtered))
+                    logger.info("%s/%s general %s-%s -> %d Copilot AI items",
+                                etype, name, d_year, d_month, len(filtered))
                     all_items.extend(self._tag(filtered, etype, name, d_year, d_month))
 
         # Deduplicate: if ai_credit and premium_request return overlapping data,
@@ -329,18 +337,35 @@ class CopilotPremiumCollector:
 
         return list(buckets.values())
 
+    @staticmethod
+    def _months_to_fetch(months_back: int) -> list[tuple[int, int]]:
+        """Return list of (year, month) tuples: current month + N previous months."""
+        now = datetime.now(timezone.utc)
+        result = []
+        for i in range(months_back + 1):
+            # Walk backwards: month 1 wraps to month 12 of previous year
+            m = now.month - i
+            y = now.year
+            while m <= 0:
+                m += 12
+                y -= 1
+            result.append((y, m))
+        return result
+
     def _fetch(self) -> CacheEntry:
         now = time.monotonic()
         with self._cache_lock:
             if self._cache and self._cache.expires_at > now:
                 return self._cache
 
+        months = self._months_to_fetch(self._config.months_back)
         all_items: list[dict[str, Any]] = []
         any_ok = False
         for etype, name in self._config.entities():
-            items, ok = self._fetch_entity(etype, name)
-            all_items.extend(items)
-            any_ok = any_ok or ok
+            for year, month in months:
+                items, ok = self._fetch_entity(etype, name, year, month)
+                all_items.extend(items)
+                any_ok = any_ok or ok
 
         self._last_fetch_ok = 1 if any_ok else 0
         if any_ok:
@@ -395,9 +420,9 @@ def main() -> None:
     logging.basicConfig(
         level=getattr(logging, config.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    logger.info("Starting exporter on %s:%d | orgs=%s enterprises=%s | cache_ttl=%ds",
+    logger.info("Starting exporter on %s:%d | orgs=%s enterprises=%s | cache_ttl=%ds | months_back=%d",
                 config.host, config.port, config.organizations, config.enterprises,
-                config.cache_ttl)
+                config.cache_ttl, config.months_back)
     CopilotPremiumCollector(config)
     start_http_server(config.port, addr=config.host)
     logger.info("Exporter ready — metrics on /metrics")
