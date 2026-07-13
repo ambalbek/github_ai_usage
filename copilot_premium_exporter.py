@@ -79,7 +79,7 @@ class ExporterConfig:
     http_timeout: int = 30
     port: int = 9185
     host: str = "0.0.0.0"
-    months_back: int = 1
+    months_back: int = 11
     log_level: str = "INFO"
     api_version: str = "2022-11-28"
     api_base: str = "https://api.github.com"
@@ -271,6 +271,9 @@ class CopilotPremiumCollector:
             if items:
                 logger.info("%s/%s ai_credit %s-%s -> %d items",
                             etype, name, d_year, d_month, len(items))
+                for it in items:
+                    logger.debug("  ai_credit item: model=%s sku=%s netAmount=%s grossAmount=%s",
+                                 it.get("model"), it.get("sku"), it.get("netAmount"), it.get("grossAmount"))
                 all_items.extend(self._tag(items, etype, name, r_year, r_month))
 
         # 2. Premium Request (legacy, for annual plans not yet migrated).
@@ -284,23 +287,25 @@ class CopilotPremiumCollector:
             if items:
                 logger.info("%s/%s premium_request %s-%s -> %d items",
                             etype, name, d_year, d_month, len(items))
+                for it in items:
+                    logger.debug("  premium_request item: model=%s sku=%s netAmount=%s grossAmount=%s",
+                                 it.get("model"), it.get("sku"), it.get("netAmount"), it.get("grossAmount"))
                 all_items.extend(self._tag(items, etype, name, r_year, r_month))
 
-        # 3. General usage, filtered to Copilot AI SKUs (drop seat licenses).
-        if not all_items:
-            data = self._get(self._endpoint(etype, name, "usage"), params=params)
-            if data is not None:
-                ok = True
-                raw_items = data.get("usageItems", []) or []
-                filtered = [
-                    it for it in raw_items
-                    if (it.get("product") or "").lower() == "copilot"
-                    and (it.get("sku") or "").strip().lower() not in self._config.exclude_skus
-                ]
-                if filtered:
-                    logger.info("%s/%s general %s-%s -> %d Copilot AI items",
-                                etype, name, d_year, d_month, len(filtered))
-                    all_items.extend(self._tag(filtered, etype, name, d_year, d_month))
+        # 3. General usage — always called, filtered to Copilot AI SKUs (drop seat licenses).
+        data = self._get(self._endpoint(etype, name, "usage"), params=params)
+        if data is not None:
+            ok = True
+            raw_items = data.get("usageItems", []) or []
+            filtered = [
+                it for it in raw_items
+                if (it.get("product") or "").lower() == "copilot"
+                and (it.get("sku") or "").strip().lower() not in self._config.exclude_skus
+            ]
+            if filtered:
+                logger.info("%s/%s general %s-%s -> %d Copilot AI items",
+                            etype, name, d_year, d_month, len(filtered))
+                all_items.extend(self._tag(filtered, etype, name, d_year, d_month))
 
         # Deduplicate: if ai_credit and premium_request return overlapping data,
         # keep unique entries by (model, sku, product, unitType). Sum amounts.
