@@ -466,6 +466,70 @@ A pre-built Kibana dashboard is included at `kibana/dashboards/copilot-premium.n
 
 ---
 
+## Local Testing
+
+### Option 1 — Standalone with Elasticsearch
+
+```bash
+# 1. Create a virtual environment and install deps
+python -m venv venv
+source venv/bin/activate   # Linux/macOS
+# venv\Scripts\activate    # Windows
+pip install -r requirements.txt
+
+# 2. Set all required env vars
+export GITHUB_TOKEN=ghp_your_token_here
+export ELASTICSEARCH_URL=https://your-es-host:9200
+export ES_API_KEY=your-elasticsearch-api-key
+
+# 3. Run the exporter
+python copilot_premium_exporter.py
+
+# 4. Verify Prometheus metrics
+curl http://localhost:9185/metrics
+
+# 5. Check logs — you should see:
+#    "Elasticsearch enabled: https://... index=ds-copilot-billing"
+#    "Elasticsearch bulk: N indexed, 0 errors"
+```
+
+### Option 2 — Docker Compose with Elasticsearch
+
+```bash
+export GITHUB_TOKEN=ghp_your_token_here
+export ELASTICSEARCH_URL=https://your-es-host:9200
+export ES_API_KEY=your-elasticsearch-api-key
+
+docker compose up -d --build
+
+# Watch exporter logs
+docker compose logs -f exporter
+
+# Verify metrics
+curl http://localhost:9185/metrics
+```
+
+### Option 3 — Prometheus-only (no Elasticsearch)
+
+If you don't set `ELASTICSEARCH_URL` and `ES_API_KEY`, the exporter runs in Prometheus-only mode — same as before the ES integration was added.
+
+```bash
+export GITHUB_TOKEN=ghp_your_token_here
+python copilot_premium_exporter.py
+# Logs will NOT show "Elasticsearch enabled" — that's expected
+```
+
+### Option 4 — Unit tests only (no tokens needed)
+
+```bash
+pip install -r requirements-dev.txt
+pytest test_copilot_premium_exporter.py -v
+```
+
+This runs all 30 tests including ES doc structure, bulk send, empty items noop, ES failure resilience, and config loading — no real GitHub token or Elasticsearch cluster needed.
+
+---
+
 ## Troubleshooting
 
 ### Exporter starts but metrics show no usage data
@@ -487,6 +551,13 @@ A pre-built Kibana dashboard is included at `kibana/dashboards/copilot-premium.n
 1. Check Prometheus is scraping: open http://localhost:9090/targets — the exporter target should show **UP**.
 2. Run a test query in Prometheus: `github_premium_request_usage_net_amount` — if empty, the exporter hasn't collected data yet. Wait for the first scrape (up to 60s).
 3. In Grafana, verify the datasource: **Settings** → **Data sources** → **Prometheus** → **Test**.
+
+### Elasticsearch shows no data
+
+- **Logs say "Elasticsearch enabled" but no "bulk" line**: The exporter only sends to ES on cache miss. Wait for the cache TTL to expire (default 15 min) or restart the exporter.
+- **"Elasticsearch bulk failed: ConnectionError"**: Check `ELASTICSEARCH_URL` is reachable from the exporter. Test with `curl $ELASTICSEARCH_URL`.
+- **"Elasticsearch bulk failed: AuthenticationException"**: The `ES_API_KEY` is invalid or expired. Generate a new one in Kibana → Stack Management → API keys.
+- **ES not enabled at all**: Both `ELASTICSEARCH_URL` (or `elasticsearch_url` in config.json) **and** `ES_API_KEY` must be set. If either is missing, ES is silently disabled.
 
 ### Exporter won't start
 
