@@ -386,7 +386,7 @@ docker compose up -d --build
 Create the ES API key secret:
 
 ```bash
-kubectl create secret generic es-api-key \
+kubectl create secret generic elk-apikey \
   --namespace monitoring \
   --from-literal=ES_API_KEY=your-api-key
 ```
@@ -399,7 +399,7 @@ config:
   elasticsearch_index: "ds-copilot-billing"
 
 elasticsearch:
-  existingSecret: "es-api-key"
+  existingSecret: "elk-apikey"
   apiKeySecretKey: "ES_API_KEY"
 ```
 

@@ -78,7 +78,7 @@ kubectl create secret generic github-token \
 ### Elasticsearch API key (optional — only if using ES integration)
 
 ```bash
-kubectl create secret generic es-api-key \
+kubectl create secret generic elk-apikey \
   --namespace monitoring \
   --from-literal=ES_API_KEY=<ELASTICSEARCH_API_KEY>
 ```
@@ -125,7 +125,7 @@ values:
     elasticsearch_index: "ds-copilot-billing"
 
   elasticsearch:
-    existingSecret: "es-api-key"  # optional — secret created above
+    existingSecret: "elk-apikey"  # optional — secret created above
     apiKeySecretKey: "ES_API_KEY"
 
   serviceMonitor:

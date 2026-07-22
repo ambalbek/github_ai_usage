@@ -22,8 +22,7 @@ config:
   elasticsearch_index: "ds-copilot-billing"
 
 elasticsearch:
-  existingSecret: ""
-  apiKeySecret: ""
+  existingSecret: "elk-apikey"
   apiKeySecretKey: "ES_API_KEY"
 
 service:

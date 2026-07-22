@@ -49,7 +49,7 @@ spec:
       elasticsearch_index: "ds-copilot-billing"
 
     elasticsearch:
-      existingSecret: ""
+      existingSecret: "elk-apikey"
       apiKeySecretKey: "ES_API_KEY"
 
     serviceMonitor:

@@ -14,6 +14,7 @@
   "log_level": "INFO",
   "api_version": "2022-11-28",
 
+  "_es_comment": "Elasticsearch is optional. Set elasticsearch_url here and ES_API_KEY as an env var (never in this file). In AKS, ES_API_KEY comes from the 'elk-apikey' secret.",
   "elasticsearch_url": "",
   "elasticsearch_index": "ds-copilot-billing"
 }
