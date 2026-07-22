@@ -42,7 +42,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "copilot-premium-exporter.secretName" . }}
                   key: GITHUB_TOKEN
-            {{- if .Values.elasticsearch.existingSecret }}
+            {{- if and .Values.elasticsearch.existingSecret .Values.config.elasticsearch_url }}
             - name: ES_API_KEY
               valueFrom:
                 secretKeyRef:

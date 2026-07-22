@@ -19,8 +19,14 @@ config:
   log_level: "INFO"
   api_version: "2022-11-28"
 
+elasticsearch:
+  existingSecret: ""
+
 serviceMonitor:
   enabled: false
 
 grafanaDashboard:
+  enabled: false
+
+kibanaDashboard:
   enabled: false

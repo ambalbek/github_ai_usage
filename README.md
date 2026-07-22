@@ -18,6 +18,7 @@ A Python exporter that collects Copilot AI Credits usage from GitHub's Enhanced 
 - [Example PromQL Queries](#example-promql-queries)
 - [Elasticsearch Integration (Optional)](#elasticsearch-integration-optional)
 - [Kibana Dashboard](#kibana-dashboard)
+- [Local Testing](#local-testing)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
 
