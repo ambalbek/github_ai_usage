@@ -64,8 +64,16 @@ flowchart TD
     RETRY -- "Still failing" --> ERR_AUTH
 
     ERR_AUTH & ERR_404 & ERR_RATE --> FAIL["Increment <b>scrape_failures_total</b><br/>per entity_type"]:::red
-    PARSE --> BUILD
+    PARSE --> ESCHECK
     FAIL --> BUILD
+
+    ESCHECK{"Elasticsearch<br/>enabled?"}:::yellow
+    ESCHECK -- "Yes" --> ESSEND["<b>ElasticsearchSender.send()</b><br/>Bulk index to ds-copilot-billing<br/><i>best-effort, failures logged</i>"]:::escolor
+    ESCHECK -- "No" --> BUILD
+    ESSEND --> BUILD
+
+    ESSEND -.->|"bulk API"| ELASTIC[("<b>ELASTICSEARCH</b><br/>ds-copilot-billing index")]:::escolor
+    ELASTIC -.-> KIBANA(["<b>KIBANA</b><br/>AI Usage Dashboard<br/>Spend | Models | Trends"]):::escolor
 
     BUILD["<b>Build fresh GaugeMetricFamily</b><br/>for each metric<br/><i>stale series auto-disappear</i>"]:::grey
 
@@ -108,6 +116,7 @@ flowchart TD
     classDef greenlight fill:#ecfccb,stroke:#65a30d,color:#365314,rx:4,font-size:13px
     classDef orangelight fill:#fed7aa,stroke:#ea580c,color:#7c2d12,rx:4,font-size:13px
     classDef dash fill:#fff7ed,stroke:#f97316,color:#9a3412,font-weight:bold,rx:8
+    classDef escolor fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e,font-weight:bold,rx:8
         </div>
     </div>
 

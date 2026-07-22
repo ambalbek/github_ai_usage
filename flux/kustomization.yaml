@@ -3,3 +3,4 @@ kind: Kustomization
 resources:
   - copilot_premium_exporter.yml
   - grafana.yml
+  - image-automation.yaml

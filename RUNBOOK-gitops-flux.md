@@ -75,6 +75,14 @@ kubectl create secret generic github-token \
 
 > The PAT needs `read:org` and `read:enterprise` scopes for billing data.
 
+### Elasticsearch API key (optional — only if using ES integration)
+
+```bash
+kubectl create secret generic es-api-key \
+  --namespace monitoring \
+  --from-literal=ES_API_KEY=<ELASTICSEARCH_API_KEY>
+```
+
 ### Image pull secret (for GHCR private images)
 
 ```bash
@@ -112,12 +120,23 @@ values:
       - "Copilot Business"
       - "Copilot Enterprise"
 
+  config:
+    elasticsearch_url: "https://your-es-host:9200"  # optional — leave empty to disable
+    elasticsearch_index: "ds-copilot-billing"
+
+  elasticsearch:
+    existingSecret: "es-api-key"  # optional — secret created above
+    apiKeySecretKey: "ES_API_KEY"
+
   serviceMonitor:
     enabled: true                 # requires Prometheus Operator
     labels: {}                    # add labels if your Prometheus uses serviceMonitorSelector
 
   grafanaDashboard:
     enabled: true                 # creates ConfigMap for Grafana sidecar
+
+  kibanaDashboard:
+    enabled: false                # creates ConfigMap with Kibana NDJSON
 ```
 
 ### ServiceMonitor labels

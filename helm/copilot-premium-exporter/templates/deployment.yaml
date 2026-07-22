@@ -42,6 +42,13 @@ spec:
                 secretKeyRef:
                   name: {{ include "copilot-premium-exporter.secretName" . }}
                   key: GITHUB_TOKEN
+            {{- if .Values.elasticsearch.existingSecret }}
+            - name: ES_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.elasticsearch.existingSecret }}
+                  key: {{ .Values.elasticsearch.apiKeySecretKey | default "ES_API_KEY" }}
+            {{- end }}
           volumeMounts:
             - name: config
               mountPath: /app/config.json

@@ -19,6 +19,8 @@ from threading import Lock
 from typing import Any, Iterable
 
 import requests
+from elasticsearch import Elasticsearch
+from elasticsearch.helpers import bulk as es_bulk
 from prometheus_client import (
     REGISTRY,
     CollectorRegistry,
@@ -83,6 +85,10 @@ class ExporterConfig:
     log_level: str = "INFO"
     api_version: str = "2022-11-28"
     api_base: str = "https://api.github.com"
+    elasticsearch_url: str = ""
+    elasticsearch_api_key: str = ""
+    elasticsearch_index: str = "ds-copilot-billing"
+    elasticsearch_enabled: bool = False
 
     @classmethod
     def load(cls, config_path: Path = CONFIG_PATH) -> "ExporterConfig":
@@ -112,6 +118,10 @@ class ExporterConfig:
         exclude_set = ({s.lower() for s in _as_list(exclude)}
                        if exclude is not None else set(DEFAULT_EXCLUDE_SKUS))
 
+        es_url = os.environ.get("ELASTICSEARCH_URL") or raw.get("elasticsearch_url", "")
+        es_api_key = os.environ.get("ES_API_KEY", "")
+        es_index = os.environ.get("ES_INDEX") or raw.get("elasticsearch_index", "ds-copilot-billing")
+
         return cls(
             token=token,
             organizations=orgs,
@@ -125,6 +135,10 @@ class ExporterConfig:
             log_level=raw.get("log_level", "INFO"),
             api_version=raw.get("api_version", "2022-11-28"),
             api_base=raw.get("api_base", "https://api.github.com").rstrip("/"),
+            elasticsearch_url=es_url,
+            elasticsearch_api_key=es_api_key,
+            elasticsearch_index=es_index,
+            elasticsearch_enabled=bool(es_url and es_api_key),
         )
 
     def entities(self) -> list[tuple[str, str]]:
@@ -140,16 +154,70 @@ class CacheEntry:
     expires_at: float
 
 
+class ElasticsearchSender:
+    """Best-effort sender that bulk-indexes billing items into Elasticsearch."""
+
+    def __init__(self, config: ExporterConfig):
+        self._index = config.elasticsearch_index
+        self._client = Elasticsearch(
+            config.elasticsearch_url,
+            api_key=config.elasticsearch_api_key,
+        )
+
+    @staticmethod
+    def _to_doc(item: dict[str, Any]) -> dict[str, Any]:
+        year = item.get("_year", "1970")
+        month = item.get("_month", "1")
+        timestamp = f"{year}-{int(month):02d}-01T00:00:00Z"
+        return {
+            "@timestamp": timestamp,
+            "entity": {
+                "type": item.get("_type", ""),
+                "name": item.get("_name", ""),
+            },
+            "billing": {
+                "product": item.get("product", ""),
+                "sku": item.get("sku", ""),
+                "model": item.get("model", ""),
+                "unit_type": item.get("unitType", ""),
+                "gross_quantity": item.get("grossQuantity", 0),
+                "net_quantity": item.get("netQuantity", 0),
+                "discount_quantity": item.get("discountQuantity", 0),
+                "gross_amount": item.get("grossAmount", 0),
+                "net_amount": item.get("netAmount", 0),
+                "discount_amount": item.get("discountAmount", 0),
+                "price_per_unit": item.get("pricePerUnit", 0),
+            },
+        }
+
+    def send(self, items: list[dict[str, Any]]) -> None:
+        if not items:
+            return
+        actions = [
+            {"_index": self._index, "_source": self._to_doc(item)}
+            for item in items
+        ]
+        try:
+            success, errors = es_bulk(self._client, actions, raise_on_error=False)
+            logger.info("Elasticsearch bulk: %d indexed, %d errors", success, len(errors))
+            if errors:
+                logger.warning("Elasticsearch bulk errors: %s", errors[:3])
+        except Exception as exc:
+            logger.error("Elasticsearch bulk failed: %s", exc)
+
+
 class CopilotPremiumCollector:
     """Custom Prometheus collector for GitHub Copilot billing data."""
 
-    def __init__(self, config: ExporterConfig, registry: CollectorRegistry | None = REGISTRY):
+    def __init__(self, config: ExporterConfig, registry: CollectorRegistry | None = REGISTRY,
+                 es_sender: ElasticsearchSender | None = None):
         self._config = config
         self._session = self._build_session()
         self._cache: CacheEntry | None = None
         self._cache_lock = Lock()
         self._last_success_ts = 0.0
         self._last_fetch_ok = 0
+        self._es_sender = es_sender
 
         self._scrape_duration = Histogram(
             "github_premium_request_scrape_duration_seconds",
@@ -315,18 +383,19 @@ class CopilotPremiumCollector:
     def _deduplicate(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Merge items with the same (model, sku, product, unitType, _year, _month).
 
-        Sums quantity/amount fields; keeps pricePerUnit from any entry.
+        Keeps the higher value for each numeric field, since overlapping items
+        from different endpoints represent the same usage, not additive usage.
         """
         buckets: dict[tuple, dict[str, Any]] = {}
-        summable = {"grossQuantity", "netQuantity", "discountQuantity",
-                    "grossAmount", "netAmount", "discountAmount", "quantity"}
+        comparable = {"grossQuantity", "netQuantity", "discountQuantity",
+                      "grossAmount", "netAmount", "discountAmount", "quantity"}
 
         for item in items:
             key = (
-                item.get("model", ""),
-                item.get("sku", ""),
-                item.get("product", ""),
-                item.get("unitType", ""),
+                (item.get("model") or "").lower(),
+                (item.get("sku") or "").lower(),
+                (item.get("product") or "").lower(),
+                (item.get("unitType") or "").lower(),
                 item.get("_year", ""),
                 item.get("_month", ""),
             )
@@ -334,9 +403,9 @@ class CopilotPremiumCollector:
                 buckets[key] = dict(item)
             else:
                 existing = buckets[key]
-                for f in summable:
+                for f in comparable:
                     if f in item:
-                        existing[f] = existing.get(f, 0) + item.get(f, 0)
+                        existing[f] = max(existing.get(f, 0), item.get(f, 0))
                 if "pricePerUnit" in item:
                     existing["pricePerUnit"] = item["pricePerUnit"]
 
@@ -375,6 +444,12 @@ class CopilotPremiumCollector:
         self._last_fetch_ok = 1 if any_ok else 0
         if any_ok:
             self._last_success_ts = time.time()
+
+        if any_ok and self._es_sender:
+            try:
+                self._es_sender.send(all_items)
+            except Exception as exc:
+                logger.error("Elasticsearch send failed: %s", exc)
 
         entry = CacheEntry(items=all_items, expires_at=time.monotonic() + self._config.cache_ttl)
         with self._cache_lock:
@@ -428,7 +503,11 @@ def main() -> None:
     logger.info("Starting exporter on %s:%d | orgs=%s enterprises=%s | cache_ttl=%ds | months_back=%d",
                 config.host, config.port, config.organizations, config.enterprises,
                 config.cache_ttl, config.months_back)
-    CopilotPremiumCollector(config)
+    es_sender = None
+    if config.elasticsearch_enabled:
+        es_sender = ElasticsearchSender(config)
+        logger.info("Elasticsearch enabled: %s index=%s", config.elasticsearch_url, config.elasticsearch_index)
+    CopilotPremiumCollector(config, es_sender=es_sender)
     start_http_server(config.port, addr=config.host)
     logger.info("Exporter ready — metrics on /metrics")
     try:

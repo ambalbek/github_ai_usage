@@ -7,6 +7,9 @@ services:
       dockerfile: Dockerfile
     environment:
       GITHUB_TOKEN: "${GITHUB_TOKEN}"
+      ELASTICSEARCH_URL: "${ELASTICSEARCH_URL:-}"
+      ES_API_KEY: "${ES_API_KEY:-}"
+      ES_INDEX: "${ES_INDEX:-}"
     volumes:
       - ./config.json:/app/config.json:ro
     ports:

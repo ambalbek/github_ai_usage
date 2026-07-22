@@ -30,3 +30,11 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- include "copilot-premium-exporter.fullname" . }}
 {{- end }}
 {{- end }}
+
+{{- define "copilot-premium-exporter.esSecretName" -}}
+{{- if .Values.elasticsearch.existingSecret }}
+{{- .Values.elasticsearch.existingSecret }}
+{{- else }}
+{{- printf "%s-es" (include "copilot-premium-exporter.fullname" .) }}
+{{- end }}
+{{- end }}

@@ -1,6 +1,6 @@
-# GitHub Copilot Premium Request — Prometheus Exporter
+# GitHub Copilot Premium Request — Prometheus Exporter + Elasticsearch
 
-A Python Prometheus exporter that collects Copilot AI Credits usage from GitHub's Enhanced Billing Platform and exposes it as Prometheus metrics. Includes a pre-built Grafana dashboard.
+A Python exporter that collects Copilot AI Credits usage from GitHub's Enhanced Billing Platform and exposes it as Prometheus metrics **and optionally indexes into Elasticsearch**. Includes pre-built Grafana and Kibana dashboards.
 
 ---
 
@@ -16,6 +16,8 @@ A Python Prometheus exporter that collects Copilot AI Credits usage from GitHub'
 - [Configuration Reference](#configuration-reference)
 - [Metrics Reference](#metrics-reference)
 - [Example PromQL Queries](#example-promql-queries)
+- [Elasticsearch Integration (Optional)](#elasticsearch-integration-optional)
+- [Kibana Dashboard](#kibana-dashboard)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
 
@@ -43,14 +45,17 @@ A Python Prometheus exporter that collects Copilot AI Credits usage from GitHub'
 ├── docker-compose.yml                   # Full stack: exporter + Prometheus + Grafana
 ├── prometheus.yml                       # Prometheus scrape config
 ├── flowchart.html                       # Architecture diagram (open in browser)
-└── grafana/
-    ├── dashboards/
-    │   └── copilot-premium.json         # Pre-built Grafana dashboard
-    └── provisioning/
-        ├── datasources/
-        │   └── prometheus.yml           # Auto-configures Prometheus datasource
-        └── dashboards/
-            └── dashboards.yml           # Auto-loads dashboard from file
+├── grafana/
+│   ├── dashboards/
+│   │   └── copilot-premium.json         # Pre-built Grafana dashboard
+│   └── provisioning/
+│       ├── datasources/
+│       │   └── prometheus.yml           # Auto-configures Prometheus datasource
+│       └── dashboards/
+│           └── dashboards.yml           # Auto-loads dashboard from file
+└── kibana/
+    └── dashboards/
+        └── copilot-premium.ndjson       # Pre-built Kibana dashboard (Lens)
 ```
 
 ---
@@ -252,12 +257,17 @@ When using Docker Compose, the dashboard is **auto-provisioned** — no manual i
 | `exporter_port`        | No       | `9185`       | Port the exporter listens on                          |
 | `exporter_host`        | No       | `0.0.0.0`    | Host/IP to bind to                                    |
 | `log_level`            | No       | `INFO`       | Log verbosity: DEBUG, INFO, WARNING, ERROR, CRITICAL  |
+| `elasticsearch_url`    | No       | `""`         | Elasticsearch URL (e.g., `https://es:9200`). Empty = disabled |
+| `elasticsearch_index`  | No       | `ds-copilot-billing` | Elasticsearch index / data stream name        |
 
-### Environment Variable
+### Environment Variables
 
-| Variable       | Required | Description                                    |
-|----------------|----------|------------------------------------------------|
-| `GITHUB_TOKEN` | Yes      | GitHub PAT — kept as env var, never in files   |
+| Variable            | Required | Description                                    |
+|---------------------|----------|------------------------------------------------|
+| `GITHUB_TOKEN`      | Yes      | GitHub PAT — kept as env var, never in files   |
+| `ELASTICSEARCH_URL` | No       | Overrides `elasticsearch_url` in config.json   |
+| `ES_API_KEY`        | No       | Elasticsearch API key (enables ES integration) |
+| `ES_INDEX`          | No       | Overrides `elasticsearch_index` in config.json |
 
 ---
 
@@ -335,6 +345,127 @@ min_over_time(github_premium_request_scrape_success[1h])
 
 ---
 
+## Elasticsearch Integration (Optional)
+
+The exporter can optionally push billing data to Elasticsearch on each cache refresh. This is **best-effort** — ES failures never break Prometheus metrics.
+
+### Enable Elasticsearch
+
+1. Set the ES URL in `config.json` (or via `ELASTICSEARCH_URL` env var):
+
+```json
+{
+    "elasticsearch_url": "https://your-es-host:9200",
+    "elasticsearch_index": "ds-copilot-billing"
+}
+```
+
+2. Set the API key as an environment variable:
+
+```bash
+export ES_API_KEY=your-elasticsearch-api-key
+```
+
+3. Restart the exporter. You should see in logs:
+
+```
+Elasticsearch enabled: https://your-es-host:9200 index=ds-copilot-billing
+```
+
+### Docker Compose with Elasticsearch
+
+```bash
+export GITHUB_TOKEN=ghp_your_token
+export ELASTICSEARCH_URL=https://your-es-host:9200
+export ES_API_KEY=your-api-key
+docker compose up -d --build
+```
+
+### Kubernetes (Flux)
+
+Create the ES API key secret:
+
+```bash
+kubectl create secret generic es-api-key \
+  --namespace monitoring \
+  --from-literal=ES_API_KEY=your-api-key
+```
+
+Then in `copilot_premium_exporter.yml`:
+
+```yaml
+config:
+  elasticsearch_url: "https://your-es-host:9200"
+  elasticsearch_index: "ds-copilot-billing"
+
+elasticsearch:
+  existingSecret: "es-api-key"
+  apiKeySecretKey: "ES_API_KEY"
+```
+
+### Elasticsearch Document Structure
+
+Each billing item is indexed with this structure:
+
+```json
+{
+  "@timestamp": "2026-07-01T00:00:00Z",
+  "entity": {
+    "type": "enterprise",
+    "name": "my-enterprise"
+  },
+  "billing": {
+    "product": "Copilot",
+    "sku": "Copilot AI Credits",
+    "model": "GPT-5",
+    "unit_type": "ai-credits",
+    "gross_quantity": 400,
+    "net_quantity": 400,
+    "discount_quantity": 0,
+    "gross_amount": 4.00,
+    "net_amount": 4.00,
+    "discount_amount": 0.00,
+    "price_per_unit": 0.01
+  }
+}
+```
+
+> **Note**: The data stream template / ILM policy should be configured separately on the Elasticsearch side.
+
+---
+
+## Kibana Dashboard
+
+A pre-built Kibana dashboard is included at `kibana/dashboards/copilot-premium.ndjson`.
+
+### Import into Kibana
+
+1. Open Kibana → **Stack Management** → **Saved Objects**
+2. Click **Import**
+3. Select `kibana/dashboards/copilot-premium.ndjson`
+4. Click **Import**
+5. Navigate to **Dashboards** → **GitHub Enterprise — AI Usage by Model (ELK)**
+
+### Dashboard Panels
+
+| Section              | Panel                              | Type           |
+|----------------------|------------------------------------|----------------|
+| **Overview**         | Net Spend / Gross Spend / Discount / Credits / Requests | Metric |
+| **Spend by Model**   | Top Models by Net Spend            | Bar (horizontal) |
+|                      | Net Spend Share by Model           | Pie (donut)    |
+|                      | Net Spend by Model (Over Time)     | Area (stacked) |
+| **Requests by Model**| Net Requests by Model (Over Time)  | Area (stacked) |
+|                      | Net Requests Share by Model        | Pie (donut)    |
+| **Cost Efficiency**  | Price per Unit by Model            | Bar (horizontal) |
+|                      | Net Spend by Entity                | Bar (horizontal) |
+| **By SKU**           | Net Spend by SKU (Over Time)       | Area (stacked) |
+| **Month Comparison** | Net Spend / Credits by Month       | Bar (vertical) |
+|                      | Net Spend by Model — Month Comparison | Bar (stacked) |
+| **Detail Tables**    | Per-Model Cost & Usage Breakdown   | Data table     |
+|                      | Monthly Summary                    | Data table     |
+
+---
+
 ## Troubleshooting
 
 ### Exporter starts but metrics show no usage data
@@ -380,8 +511,12 @@ pytest test_copilot_premium_exporter.py -v
 |-------------------------|-----------------------------------------------------|
 | `TestConstructor`       | Config wiring, auth header, API version header       |
 | `TestLoadConfig`        | config.json loading, missing org exits, missing token exits |
+| `TestEndpointPriority`  | All three endpoints called, fallback logic, 404 handling |
 | `TestCollectWithData`   | Metric families, label values, discount values, success flag |
 | `TestCacheTTL`          | Cache hit within TTL, cache miss after TTL           |
 | `TestEmptyUsageItems`   | Empty response doesn't crash, still yields families  |
 | `TestAuthFailure`       | 401/403 set success=0, increment failure counter     |
-| `TestNotFound`          | 404 doesn't crash, yields empty families             |
+| `TestMultiMonth`        | Multi-month fetching, year wrap, months_back=0       |
+| `TestExcludeSkus`       | Seat license SKUs excluded from general endpoint     |
+| `TestElasticsearchSender` | Doc structure, bulk send, empty noop, ES failure resilience |
+| `TestElasticsearchConfig` | ES disabled by default, enabled when configured, config loading |

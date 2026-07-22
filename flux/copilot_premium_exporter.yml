@@ -10,6 +10,7 @@ spec:
     disableWait: true
   upgrade:
     disableWait: true
+    force: true
   releaseName: copilot-premium-exporter
   chart:
     spec:
@@ -22,8 +23,8 @@ spec:
   values:
     image:
       repository: ghcr.io/<owner>/copilot-premium-exporter
-      tag: latest
-      pullPolicy: IfNotPresent
+      tag: main  # {"$imagepolicy": "flux-system:copilot-premium-exporter:tag"}
+      pullPolicy: Always
 
     # Use externally managed secret for GITHUB_TOKEN
     existingSecret: "github-token"
@@ -44,6 +45,12 @@ spec:
       exporter_host: "0.0.0.0"
       log_level: "INFO"
       api_version: "2022-11-28"
+      elasticsearch_url: ""
+      elasticsearch_index: "ds-copilot-billing"
+
+    elasticsearch:
+      existingSecret: ""
+      apiKeySecretKey: "ES_API_KEY"
 
     serviceMonitor:
       enabled: true
@@ -53,6 +60,9 @@ spec:
 
     grafanaDashboard:
       enabled: true
+
+    kibanaDashboard:
+      enabled: false
 
     resources:
       requests:

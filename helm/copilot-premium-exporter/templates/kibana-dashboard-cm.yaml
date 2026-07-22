@@ -1,0 +1,12 @@
+{{- if .Values.kibanaDashboard.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "copilot-premium-exporter.fullname" . }}-kibana-dashboard
+  labels:
+    {{- include "copilot-premium-exporter.labels" . | nindent 4 }}
+data:
+  copilot-premium.ndjson: |-
+    {{- .Files.Get "dashboards/copilot-premium.ndjson" | nindent 4 }}
+{{- end }}

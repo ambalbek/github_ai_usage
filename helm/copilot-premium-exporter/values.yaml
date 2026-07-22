@@ -18,6 +18,13 @@ config:
   exporter_host: "0.0.0.0"
   log_level: "INFO"
   api_version: "2022-11-28"
+  elasticsearch_url: ""
+  elasticsearch_index: "ds-copilot-billing"
+
+elasticsearch:
+  existingSecret: ""
+  apiKeySecret: ""
+  apiKeySecretKey: "ES_API_KEY"
 
 service:
   type: ClusterIP
@@ -30,6 +37,9 @@ serviceMonitor:
   labels: {}
 
 grafanaDashboard:
+  enabled: false
+
+kibanaDashboard:
   enabled: false
 
 resources: {}

@@ -10,14 +10,18 @@ copilot_premium_exporter/
 ├── test_copilot_premium_exporter.py
 ├── Dockerfile
 ├── config.json
-├── requirements.txt
+├── requirements.txt              # prometheus-client, requests, elasticsearch
 ├── requirements-dev.txt
+├── kibana/
+│   └── dashboards/
+│       └── copilot-premium.ndjson    # Pre-built Kibana dashboard (Lens)
 └── helm/copilot-premium-exporter/
     ├── Chart.yaml
     ├── values.yaml
     ├── values-local.yaml
     ├── dashboards/
-    │   └── copilot-premium.json      # Grafana dashboard JSON
+    │   ├── copilot-premium.json      # Grafana dashboard JSON
+    │   └── copilot-premium.ndjson    # Kibana dashboard NDJSON
     └── templates/
         ├── _helpers.tpl
         ├── configmap.yaml
@@ -25,6 +29,7 @@ copilot_premium_exporter/
         ├── service.yaml
         ├── servicemonitor.yaml
         ├── grafana-dashboard-cm.yaml
+        ├── kibana-dashboard-cm.yaml
         └── secret.yaml
 ```
 
@@ -154,9 +159,14 @@ curl http://localhost:9185/metrics
 | `config.exclude_skus` | SKUs to exclude from general endpoint | `[]` |
 | `config.cache_ttl_seconds` | Cache TTL for API responses | `900` |
 | `config.exporter_port` | Metrics port | `9185` |
+| `config.elasticsearch_url` | Elasticsearch URL (empty = disabled) | `""` |
+| `config.elasticsearch_index` | ES index / data stream name | `ds-copilot-billing` |
+| `elasticsearch.existingSecret` | Secret containing ES_API_KEY | `""` |
+| `elasticsearch.apiKeySecretKey` | Key in the secret | `ES_API_KEY` |
 | `serviceMonitor.enabled` | Create Prometheus ServiceMonitor | `false` |
 | `serviceMonitor.interval` | Scrape interval | `60s` |
 | `grafanaDashboard.enabled` | Create Grafana dashboard ConfigMap | `false` |
+| `kibanaDashboard.enabled` | Create Kibana dashboard ConfigMap | `false` |
 | `existingSecret` | Name of existing secret with GITHUB_TOKEN | `""` |
 | `service.type` | Kubernetes Service type | `ClusterIP` |
 | `service.port` | Service port | `9185` |

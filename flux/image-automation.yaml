@@ -1,0 +1,49 @@
+apiVersion: image.toolkit.fluxcd.io/v1beta2
+kind: ImageRepository
+metadata:
+  name: copilot-premium-exporter
+  namespace: flux-system
+spec:
+  image: ghcr.io/<owner>/copilot-premium-exporter
+  interval: 5m
+  secretRef:
+    name: ghcr-secret
+---
+apiVersion: image.toolkit.fluxcd.io/v1beta2
+kind: ImagePolicy
+metadata:
+  name: copilot-premium-exporter
+  namespace: flux-system
+spec:
+  imageRepositoryRef:
+    name: copilot-premium-exporter
+  filterTags:
+    pattern: '^[a-f0-9]{40}$'
+  policy:
+    alphabetical:
+      order: asc
+---
+apiVersion: image.toolkit.fluxcd.io/v1beta2
+kind: ImageUpdateAutomation
+metadata:
+  name: copilot-premium-exporter
+  namespace: flux-system
+spec:
+  interval: 5m
+  sourceRef:
+    kind: GitRepository
+    name: copilot-premium-exporter
+  git:
+    checkout:
+      ref:
+        branch: main
+    commit:
+      author:
+        name: fluxcdbot
+        email: fluxcdbot@users.noreply.github.com
+      messageTemplate: "chore: update copilot-premium-exporter image to {{.NewTag}}"
+    push:
+      branch: main
+  update:
+    path: ./flux
+    strategy: Setters

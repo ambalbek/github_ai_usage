@@ -8,7 +8,9 @@ from pathlib import Path
 import responses
 from prometheus_client import CollectorRegistry
 
-from copilot_premium_exporter import CopilotPremiumCollector, ExporterConfig
+from unittest.mock import MagicMock, patch
+
+from copilot_premium_exporter import CopilotPremiumCollector, ElasticsearchSender, ExporterConfig
 
 SAMPLE_RESPONSE = {
     "timePeriod": {"year": 2026, "month": 6},
@@ -123,36 +125,37 @@ class TestLoadConfig:
 
 class TestEndpointPriority:
     @responses.activate
-    def test_calls_both_ai_credit_and_premium_request(self) -> None:
-        """Both ai_credit and premium_request are called to get all data."""
+    def test_calls_all_three_endpoints(self) -> None:
+        """All three endpoints are always called."""
         responses.get(AI_CREDIT_URL, json=SAMPLE_RESPONSE, status=200)
         responses.get(PREMIUM_URL, json=SAMPLE_RESPONSE, status=200)
+        responses.get(GENERAL_URL, json={"usageItems": []}, status=200)
 
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         metrics = _collect_as_dict(collector)
 
-        # Both endpoints called
-        assert len(responses.calls) == 2
+        # All three endpoints called
+        assert len(responses.calls) == 3
         urls = [c.request.url for c in responses.calls]
         assert any("ai_credit" in u for u in urls)
         assert any("premium_request" in u for u in urls)
+        assert any(u.endswith("/usage") or "/usage?" in u for u in urls)
 
         # Data is deduplicated (same model/sku) so still 2 unique models
         gross = metrics["github_premium_request_usage_gross_quantity"]
         assert len(gross) == 2
 
     @responses.activate
-    def test_falls_back_to_premium_request(self) -> None:
-        """If ai_credit returns empty, try premium_request."""
-        responses.get(AI_CREDIT_URL, json=EMPTY_RESPONSE, status=200)
-        responses.get(PREMIUM_URL, json=SAMPLE_RESPONSE, status=200)
+    def test_premium_request_empty_still_calls_general(self) -> None:
+        """If ai_credit has data but premium_request is empty, general is still called."""
+        responses.get(AI_CREDIT_URL, json=SAMPLE_RESPONSE, status=200)
+        responses.get(PREMIUM_URL, json=EMPTY_RESPONSE, status=200)
+        responses.get(GENERAL_URL, json={"usageItems": []}, status=200)
 
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         metrics = _collect_as_dict(collector)
 
-        assert len(responses.calls) == 2
-        assert "ai_credit" in responses.calls[0].request.url
-        assert "premium_request" in responses.calls[1].request.url
+        assert len(responses.calls) == 3
 
         gross = metrics["github_premium_request_usage_gross_quantity"]
         assert len(gross) == 2
@@ -202,6 +205,7 @@ class TestEndpointPriority:
         """If ai_credit returns 404, still try premium_request."""
         responses.get(AI_CREDIT_URL, json={"message": "Not Found"}, status=404)
         responses.get(PREMIUM_URL, json=SAMPLE_RESPONSE, status=200)
+        responses.get(GENERAL_URL, json={"usageItems": []}, status=200)
 
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         metrics = _collect_as_dict(collector)
@@ -214,6 +218,8 @@ class TestCollectWithData:
     @responses.activate
     def test_correct_label_values(self) -> None:
         responses.get(AI_CREDIT_URL, json=SAMPLE_RESPONSE, status=200)
+        responses.get(PREMIUM_URL, json=EMPTY_RESPONSE, status=200)
+        responses.get(GENERAL_URL, json={"usageItems": []}, status=200)
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         metrics = _collect_as_dict(collector)
 
@@ -230,6 +236,8 @@ class TestCollectWithData:
     @responses.activate
     def test_all_metric_values(self) -> None:
         responses.get(AI_CREDIT_URL, json=SAMPLE_RESPONSE, status=200)
+        responses.get(PREMIUM_URL, json=EMPTY_RESPONSE, status=200)
+        responses.get(GENERAL_URL, json={"usageItems": []}, status=200)
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         metrics = _collect_as_dict(collector)
 
@@ -245,6 +253,8 @@ class TestCollectWithData:
     @responses.activate
     def test_scrape_success_is_one(self) -> None:
         responses.get(AI_CREDIT_URL, json=SAMPLE_RESPONSE, status=200)
+        responses.get(PREMIUM_URL, json=EMPTY_RESPONSE, status=200)
+        responses.get(GENERAL_URL, json={"usageItems": []}, status=200)
         collector = CopilotPremiumCollector(_config(), registry=CollectorRegistry())
         metrics = _collect_as_dict(collector)
         assert metrics["github_premium_request_scrape_success"][0].value == 1.0
@@ -255,6 +265,7 @@ class TestCacheTTL:
     def test_cache_hit(self) -> None:
         responses.get(AI_CREDIT_URL, json=SAMPLE_RESPONSE, status=200)
         responses.get(PREMIUM_URL, json=EMPTY_RESPONSE, status=200)
+        responses.get(GENERAL_URL, json={"usageItems": []}, status=200)
         collector = CopilotPremiumCollector(_config(cache_ttl=600), registry=CollectorRegistry())
 
         list(collector.collect())
@@ -267,6 +278,7 @@ class TestCacheTTL:
     def test_cache_expired(self) -> None:
         responses.get(AI_CREDIT_URL, json=SAMPLE_RESPONSE, status=200)
         responses.get(PREMIUM_URL, json=EMPTY_RESPONSE, status=200)
+        responses.get(GENERAL_URL, json={"usageItems": []}, status=200)
         collector = CopilotPremiumCollector(_config(cache_ttl=0), registry=CollectorRegistry())
 
         list(collector.collect())
@@ -352,6 +364,7 @@ class TestMultiMonth:
 
         responses.add_callback(responses.GET, AI_CREDIT_URL, callback=ai_credit_callback)
         responses.get(PREMIUM_URL, json=EMPTY_RESPONSE, status=200)
+        responses.get(GENERAL_URL, json={"usageItems": []}, status=200)
 
         collector = CopilotPremiumCollector(
             _config(months_back=1), registry=CollectorRegistry())
@@ -381,6 +394,129 @@ class TestMultiMonth:
         """months_back=0 returns only current month."""
         months = CopilotPremiumCollector._months_to_fetch(0)
         assert len(months) == 1
+
+
+class TestElasticsearchSender:
+    def test_to_doc_structure(self) -> None:
+        item = {
+            "_type": "enterprise", "_name": "test-ent",
+            "_year": "2026", "_month": "6",
+            "product": "Copilot", "sku": "Copilot AI Credits",
+            "model": "GPT-5", "unitType": "ai-credits",
+            "grossQuantity": 400, "netQuantity": 400,
+            "discountQuantity": 0, "grossAmount": 4.0,
+            "netAmount": 4.0, "discountAmount": 0.0, "pricePerUnit": 0.01,
+        }
+        doc = ElasticsearchSender._to_doc(item)
+        assert doc["@timestamp"] == "2026-06-01T00:00:00Z"
+        assert doc["entity"]["type"] == "enterprise"
+        assert doc["entity"]["name"] == "test-ent"
+        assert doc["billing"]["product"] == "Copilot"
+        assert doc["billing"]["sku"] == "Copilot AI Credits"
+        assert doc["billing"]["model"] == "GPT-5"
+        assert doc["billing"]["unit_type"] == "ai-credits"
+        assert doc["billing"]["gross_quantity"] == 400
+        assert doc["billing"]["net_amount"] == 4.0
+        assert doc["billing"]["price_per_unit"] == 0.01
+
+    @patch("copilot_premium_exporter.Elasticsearch")
+    def test_send_calls_bulk(self, mock_es_cls) -> None:
+        mock_client = MagicMock()
+        mock_es_cls.return_value = mock_client
+        config = _config(
+            elasticsearch_url="https://es:9200",
+            elasticsearch_api_key="test-key",
+            elasticsearch_index="ds-copilot-billing",
+            elasticsearch_enabled=True,
+        )
+        sender = ElasticsearchSender(config)
+        items = [{
+            "_type": "enterprise", "_name": "test-ent",
+            "_year": "2026", "_month": "6",
+            "product": "Copilot", "sku": "AI Credits", "model": "GPT-5",
+            "unitType": "ai-credits", "grossQuantity": 100,
+            "netQuantity": 100, "grossAmount": 1.0, "netAmount": 1.0,
+            "discountQuantity": 0, "discountAmount": 0.0, "pricePerUnit": 0.01,
+        }]
+        with patch("copilot_premium_exporter.es_bulk", return_value=(1, [])) as mock_bulk:
+            sender.send(items)
+            mock_bulk.assert_called_once()
+            actions = mock_bulk.call_args[0][1]
+            assert len(actions) == 1
+            assert actions[0]["_index"] == "ds-copilot-billing"
+            assert actions[0]["_source"]["@timestamp"] == "2026-06-01T00:00:00Z"
+
+    def test_send_empty_items_noop(self) -> None:
+        with patch("copilot_premium_exporter.Elasticsearch"):
+            config = _config(
+                elasticsearch_url="https://es:9200",
+                elasticsearch_api_key="test-key",
+                elasticsearch_index="ds-copilot-billing",
+                elasticsearch_enabled=True,
+            )
+            sender = ElasticsearchSender(config)
+            with patch("copilot_premium_exporter.es_bulk") as mock_bulk:
+                sender.send([])
+                mock_bulk.assert_not_called()
+
+    @responses.activate
+    def test_es_failure_does_not_break_collect(self) -> None:
+        """ES send failure should not prevent Prometheus metrics from being returned."""
+        responses.get(AI_CREDIT_URL, json=SAMPLE_RESPONSE, status=200)
+        responses.get(PREMIUM_URL, json=EMPTY_RESPONSE, status=200)
+        responses.get(GENERAL_URL, json={"usageItems": []}, status=200)
+
+        mock_sender = MagicMock()
+        mock_sender.send.side_effect = Exception("ES connection refused")
+
+        collector = CopilotPremiumCollector(
+            _config(), registry=CollectorRegistry(), es_sender=mock_sender)
+        metrics = _collect_as_dict(collector)
+
+        # Metrics still returned despite ES failure
+        assert len(metrics["github_premium_request_usage_gross_quantity"]) == 2
+        assert metrics["github_premium_request_scrape_success"][0].value == 1.0
+        mock_sender.send.assert_called_once()
+
+
+class TestElasticsearchConfig:
+    def test_es_disabled_by_default(self) -> None:
+        config = _config()
+        assert config.elasticsearch_enabled is False
+
+    def test_es_enabled_when_configured(self) -> None:
+        config = _config(
+            elasticsearch_url="https://es:9200",
+            elasticsearch_api_key="test-key",
+            elasticsearch_enabled=True,
+        )
+        assert config.elasticsearch_enabled is True
+
+    def test_load_es_config(self, tmp_path: Path, monkeypatch) -> None:
+        cfg = tmp_path / "config.json"
+        cfg.write_text(json.dumps({
+            "github_enterprise": "my-ent",
+            "elasticsearch_url": "https://es:9200",
+            "elasticsearch_index": "my-index",
+        }))
+        monkeypatch.setenv("GITHUB_TOKEN", "tok")
+        monkeypatch.setenv("ES_API_KEY", "my-api-key")
+        config = ExporterConfig.load(config_path=cfg)
+        assert config.elasticsearch_url == "https://es:9200"
+        assert config.elasticsearch_api_key == "my-api-key"
+        assert config.elasticsearch_index == "my-index"
+        assert config.elasticsearch_enabled is True
+
+    def test_load_es_disabled_without_key(self, tmp_path: Path, monkeypatch) -> None:
+        cfg = tmp_path / "config.json"
+        cfg.write_text(json.dumps({
+            "github_enterprise": "my-ent",
+            "elasticsearch_url": "https://es:9200",
+        }))
+        monkeypatch.setenv("GITHUB_TOKEN", "tok")
+        monkeypatch.delenv("ES_API_KEY", raising=False)
+        config = ExporterConfig.load(config_path=cfg)
+        assert config.elasticsearch_enabled is False
 
 
 class TestExcludeSkus:
