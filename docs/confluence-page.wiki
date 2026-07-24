@@ -1,0 +1,823 @@
+{info:title=Quick Reference}
+*Repository:* {{github_ai_usage}} | *Port:* {{9185}} | *Metric prefix:* {{github_premium_request_}} | *App version:* 2.0
+{info}
+
+{toc:maxLevel=3}
+
+----
+
+h1. 1. Overview
+
+The *GitHub Copilot AI Credits / Premium Request Billing Exporter* is a Python-based Prometheus exporter that collects billing and usage data from the [GitHub Enhanced Billing Platform API|https://docs.github.com/en/billing/using-the-enhanced-billing-platform-for-organizations] and exposes it as Prometheus metrics on port {{9185}}. It optionally indexes the same data into Elasticsearch for long-term storage and Kibana dashboards.
+
+It answers one question: *How much are our GitHub Copilot AI features costing us -- by model, by SKU, by month, across all our orgs and enterprises?*
+
+h2. Key Capabilities
+
+* *Multi-entity support* -- monitor multiple GitHub organizations and enterprises from a single exporter instance
+* *Three-endpoint coverage* -- queries {{ai_credit/usage}}, {{premium_request/usage}}, and {{usage}} APIs to capture both new and legacy billing models
+* *Intelligent deduplication* -- merges overlapping data from multiple endpoints, keeping the highest values
+* *TTL-based caching* -- avoids hammering the GitHub API on every Prometheus scrape (default 15 min cache)
+* *Multi-month history* -- fetches current + N previous months of billing data for trend analysis
+* *Dual output* -- Prometheus metrics for real-time alerting + Elasticsearch for historical analytics
+* *Pre-built dashboards* -- Grafana (7 rows, 28 panels) and Kibana dashboards included
+* *Production-ready* -- Helm chart with Flux-compatible deployment, ServiceMonitor, health probes, non-root container
+
+----
+
+h1. 2. Architecture
+
+h2. 2.1 High-Level System Architecture
+
+The following diagram shows how the exporter fits into the overall observability stack:
+
+{noformat:title=System Architecture Diagram}
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          GitHub Cloud (api.github.com)                      │
+│                                                                             │
+│   ┌─────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐  │
+│   │  ai_credit/usage │  │ premium_request/usage │  │    usage (general)   │  │
+│   │  (new billing)   │  │   (legacy billing)    │  │  (fallback, filtered)│  │
+│   └────────┬─────────┘  └──────────┬────────────┘  └──────────┬──────────┘  │
+│            │                       │                           │             │
+└────────────┼───────────────────────┼───────────────────────────┼─────────────┘
+             │   HTTPS + Bearer Token│(with urllib3 retry 3x)    │
+             └───────────────────────┼───────────────────────────┘
+                                     │
+                                     ▼
+             ┌───────────────────────────────────────────┐
+             │      Copilot Premium Exporter (Python)    │
+             │                                           │
+             │  ┌──────────────┐   ┌──────────────────┐  │
+             │  │ExporterConfig│   │    TTL Cache      │  │
+             │  │ (config.json │   │  (in-memory,      │  │
+             │  │  + env vars) │   │   15 min default) │  │
+             │  └──────────────┘   └──────────────────┘  │
+             │                                           │
+             │  ┌──────────────────────────────────────┐ │
+             │  │  CopilotPremiumCollector              │ │
+             │  │  • fetch → tag → deduplicate → cache │ │
+             │  │  • expose as GaugeMetricFamily       │ │
+             │  └──────────────────────────────────────┘ │
+             │                                           │
+             │  ┌──────────────────────────────────────┐ │
+             │  │  ElasticsearchSender (optional)      │ │
+             │  │  • bulk index on each cache refresh  │ │
+             │  │  • best-effort, never blocks scrapes │ │
+             │  └──────────┬───────────────────────────┘ │
+             │             │                             │
+             │  Port 9185  │  /metrics                   │
+             └──────┬──────┼─────────────────────────────┘
+                    │      │
+          ┌─────────┘      └──────────────┐
+          ▼                               ▼
+┌──────────────────┐           ┌────────────────────┐
+│   Prometheus     │           │   Elasticsearch    │
+│                  │           │                    │
+│  scrape_interval │           │  index:            │
+│  = 60s           │           │  ds-copilot-billing│
+│                  │           │                    │
+└────────┬─────────┘           └────────┬───────────┘
+         │                              │
+         ▼                              ▼
+┌──────────────────┐           ┌────────────────────┐
+│     Grafana      │           │      Kibana        │
+│                  │           │                    │
+│  28 panels       │           │  Billing dashboard │
+│  7 rows          │           │  (NDJSON import)   │
+│  Budget tracking │           │                    │
+└──────────────────┘           └────────────────────┘
+{noformat}
+
+h2. 2.2 Component Breakdown
+
+The exporter is a *single Python file* ({{copilot_premium_exporter.py}}, \~520 lines) with four main components:
+
+||Component||Responsibility||Key Details||
+|{{ExporterConfig}}|Configuration loading & validation|Dataclass loaded from {{config.json}} + env vars. Token from {{GITHUB_TOKEN}} only. Supports plural/singular/env override for orgs & enterprises.|
+|{{CopilotPremiumCollector}}|Core Prometheus collector|Registered with default registry. On scrape: check cache -> fetch -> tag -> deduplicate -> return {{GaugeMetricFamily}}. Thread-safe cache with {{Lock}}.|
+|{{ElasticsearchSender}}|Optional ES bulk indexer|Converts items to ECS-style docs with {{@timestamp}}, {{entity.*}}, {{billing.*}} fields. Best-effort: failures logged, never break scrapes.|
+|{{CacheEntry}}|In-memory TTL cache|Stores fetched items with monotonic expiration timestamp. Default TTL: 900s (15 min).|
+
+----
+
+h1. 3. Data Collection Flow
+
+h2. 3.1 Scrape Lifecycle
+
+Every time Prometheus scrapes {{/metrics}}, the following flow executes:
+
+{noformat:title=Scrape Lifecycle Flowchart}
+                         Prometheus scrapes /metrics
+                                    │
+                                    ▼
+                         ┌─────────────────────┐
+                         │  collect() called    │
+                         │  on Collector        │
+                         └──────────┬───────────┘
+                                    │
+                                    ▼
+                         ┌─────────────────────┐
+                         │  Is cache still      │──── YES ──→ Return cached
+                         │  valid (TTL)?        │             GaugeMetricFamily
+                         └──────────┬───────────┘             instances
+                                    │
+                                   NO
+                                    │
+                                    ▼
+                    ┌───────────────────────────────┐
+                    │  For each entity (org/ent):   │
+                    │    For each month (0..N):     │
+                    │      Call _fetch_entity()     │◄──── See §3.2
+                    └───────────────┬───────────────┘
+                                    │
+                                    ▼
+                         ┌─────────────────────┐
+                         │  At least one        │
+                         │  HTTP 200?           │
+                         └──────────┬───────────┘
+                                    │
+                          ┌─── YES ─┼─ NO ───┐
+                          │         │        │
+                          ▼         │        ▼
+                   ┌────────────┐   │  ┌──────────────┐
+                   │ success=1  │   │  │ success=0    │
+                   │            │   │  │ return empty │
+                   └──────┬─────┘   │  └──────────────┘
+                          │         │
+                          ▼         │
+                   ┌────────────────┐
+                   │  ES enabled?   │──── YES ──→ ElasticsearchSender.send()
+                   │                │             (bulk index, best-effort)
+                   └───────┬────────┘
+                           │
+                           ▼
+                   ┌────────────────────┐
+                   │  Store in cache    │
+                   │  (TTL = now + 900s)│
+                   └───────┬────────────┘
+                           │
+                           ▼
+                   ┌────────────────────────────────────┐
+                   │  Convert items → GaugeMetricFamily │
+                   │  for each of the 7 usage metrics   │
+                   │  + 2 operational metrics           │
+                   └────────────────────────────────────┘
+{noformat}
+
+h2. 3.2 Per-Entity Fetch Strategy (Three-Endpoint Merge)
+
+For each (entity, month) pair, the exporter calls *all three* GitHub billing endpoints and merges the results. This ensures complete coverage across billing model transitions:
+
+{noformat:title=Three-Endpoint Fetch & Merge Strategy}
+_fetch_entity(entity_type, entity_name, year, month)
+│
+├──── 1. GET /settings/billing/ai_credit/usage?year=Y&month=M
+│         │
+│         ├── 200 OK → extract usageItems → tag with entity metadata
+│         └── 4xx/5xx → log error, continue (ok stays false for this endpoint)
+│
+├──── 2. GET /settings/billing/premium_request/usage?year=Y&month=M
+│         │
+│         ├── 200 OK → extract usageItems → tag with entity metadata
+│         └── 4xx/5xx → log error, continue
+│
+├──── 3. GET /settings/billing/usage?year=Y&month=M
+│         │
+│         ├── 200 OK → filter: product="Copilot" AND sku NOT IN exclude_skus
+│         │             (drops "Copilot Business", "Copilot Enterprise" seat licenses)
+│         │             → tag with entity metadata
+│         └── 4xx/5xx → log error, continue
+│
+└──── 4. DEDUPLICATE merged items
+          │
+          Key = (model, sku, product, unitType, year, month)  [case-insensitive]
+          │
+          ├── First occurrence → keep as-is
+          └── Duplicate key → merge: keep MAX of each numeric field
+                               (grossQuantity, netQuantity, grossAmount, etc.)
+                               This prevents double-counting when endpoints
+                               return overlapping data.
+{noformat}
+
+{note:title=Why three endpoints?}
+GitHub is transitioning billing models. The {{ai_credit/usage}} endpoint was introduced in June 2026 for the new AI Credits model. The {{premium_request/usage}} endpoint serves legacy annual plans. The general {{usage}} endpoint is a fallback that covers both but with less granularity (no gross/net split -- only {{quantity}}). The exporter calls all three and deduplicates to ensure no data is missed during transition periods.
+{note}
+
+h2. 3.3 Multi-Month Fetching
+
+The {{months_back}} config parameter (default: 11) controls how many months of history are fetched. With {{months_back=11}}, the exporter fetches the current month plus the 11 previous months (a full rolling year).
+
+{noformat:title=Multi-Month Fetch Example}
+Today: July 2026 | months_back=11
+
+Months fetched:  Jul'26  Jun'26  May'26  Apr'26  Mar'26  Feb'26
+                 Jan'26  Dec'25  Nov'25  Oct'25  Sep'25  Aug'25
+                 ──────  ──────  ──────  ──────  ──────  ──────
+                 current ◄──── 11 months back ────────────────►
+
+For each month × each entity × 3 endpoints = total API calls per cache refresh:
+  Example: 2 orgs × 12 months × 3 endpoints = 72 API calls
+  (All within a single cache refresh, then cached for 15 minutes)
+{noformat}
+
+----
+
+h1. 4. HTTP Resilience & Error Handling
+
+{noformat:title=HTTP Request Flow with Retry}
+┌──────────────────────────────────────────────────────────┐
+│              requests.Session (persistent)                │
+│                                                          │
+│  Headers:                                                │
+│    Accept: application/vnd.github+json                   │
+│    Authorization: Bearer <GITHUB_TOKEN>                  │
+│    X-GitHub-Api-Version: 2022-11-28                      │
+│    User-Agent: copilot-premium-exporter/2.0              │
+│                                                          │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │  urllib3 Retry Policy                              │  │
+│  │                                                    │  │
+│  │  total=3 retries                                   │  │
+│  │  backoff_factor=1  (1s, 2s, 4s between retries)   │  │
+│  │  status_forcelist=[500, 502, 503, 504]            │  │
+│  │  allowed_methods=["GET"]                           │  │
+│  └────────────────────────────────────────────────────┘  │
+│                                                          │
+│  Timeout: 30s per request (configurable)                 │
+└──────────────────────────────────────────────────────────┘
+{noformat}
+
+||HTTP Status||Behavior||
+|200|Parse JSON, return data|
+|401 / 403|Log auth error (token needs {{manage_billing:enterprise}} or {{Billing:Read}}), increment failure counter|
+|404|Log scope mismatch or entity not on Enhanced Billing Platform|
+|429|Log rate limit, serve cached data. Reset timestamp logged.|
+|5xx|Retried 3x by urllib3 with exponential backoff, then logged as failure|
+
+----
+
+h1. 5. Prometheus Metrics Reference
+
+h2. 5.1 Usage Metrics (per model/SKU)
+
+All usage metrics share the same label set: {{type}}, {{name}}, {{product}}, {{sku}}, {{model}}, {{unit}}, {{year}}, {{month}}
+
+||Metric Name||Type||Description||JSON Source Field||
+|{{github_premium_request_usage_gross_quantity}}|Gauge|Total units consumed before discounts|{{grossQuantity}}|
+|{{github_premium_request_usage_net_quantity}}|Gauge|Units consumed after discounts applied|{{netQuantity}}|
+|{{github_premium_request_usage_discount_quantity}}|Gauge|Units covered by discount/allowance|{{discountQuantity}}|
+|{{github_premium_request_usage_gross_amount}}|Gauge|Total cost in USD before discounts|{{grossAmount}}|
+|{{github_premium_request_usage_net_amount}}|Gauge|Actual cost in USD after discounts|{{netAmount}}|
+|{{github_premium_request_usage_discount_amount}}|Gauge|Discount savings in USD|{{discountAmount}}|
+|{{github_premium_request_usage_price_per_unit}}|Gauge|Unit price in USD|{{pricePerUnit}}|
+
+h2. 5.2 Label Dimensions
+
+||Label||Example Values||Description||
+|{{type}}|{{organization}}, {{enterprise}}|GitHub entity type|
+|{{name}}|{{my-org}}, {{my-enterprise}}|Entity slug/name|
+|{{product}}|{{Copilot}}|GitHub product name|
+|{{sku}}|{{Copilot AI Credits}}|Billing SKU|
+|{{model}}|{{GPT-5}}, {{Claude Sonnet 4.6}}|AI model used (empty string if not available)|
+|{{unit}}|{{ai-credits}}, {{premium-requests}}|Billing unit type|
+|{{year}}|{{2026}}|Billing period year|
+|{{month}}|{{7}}|Billing period month (1-12)|
+
+h2. 5.3 Operational Metrics
+
+||Metric Name||Type||Description||
+|{{github_premium_request_scrape_duration_seconds}}|Histogram|Duration of real GitHub API calls (cache hits excluded). Buckets: 0.1 -- 60s.|
+|{{github_premium_request_scrape_failures_total}}|Counter|Total count of failed API calls (401, 403, 404, 5xx after retries)|
+|{{github_premium_request_scrape_success}}|Gauge|1 if the last refresh reached GitHub for at least one entity, else 0|
+|{{github_premium_request_last_scrape_timestamp_seconds}}|Gauge|Unix timestamp of last successful fetch (0 if never succeeded)|
+
+----
+
+h1. 6. Elasticsearch Integration
+
+h2. 6.1 Document Structure
+
+When Elasticsearch is enabled, each billing line item is bulk-indexed as an ECS-style document:
+
+{code:language=javascript|title=Elasticsearch Document Example}
+{
+  "@timestamp": "2026-07-01T00:00:00Z",
+  "entity": {
+    "type": "organization",
+    "name": "my-org"
+  },
+  "billing": {
+    "product": "Copilot",
+    "sku": "Copilot AI Credits",
+    "model": "GPT-5",
+    "unit_type": "ai-credits",
+    "gross_quantity": 400,
+    "net_quantity": 400,
+    "discount_quantity": 0,
+    "gross_amount": 4.00,
+    "net_amount": 4.00,
+    "discount_amount": 0.00,
+    "price_per_unit": 0.01
+  }
+}
+{code}
+
+h2. 6.2 Enabling Elasticsearch
+
+||Setting||Source||Description||
+|{{elasticsearch_url}}|config.json or {{ELASTICSEARCH_URL}} env|ES cluster URL (e.g., {{https://es:9200}})|
+|{{ES_API_KEY}}|Environment variable only|API key for authentication (never in config file)|
+|{{elasticsearch_index}}|config.json or {{ES_INDEX}} env|Target index name (default: {{ds-copilot-billing}})|
+
+ES is enabled automatically when *both* {{elasticsearch_url}} and {{ES_API_KEY}} are set. The sender is best-effort: failures are logged but never prevent Prometheus metrics from being served.
+
+----
+
+h1. 7. Configuration
+
+h2. 7.1 Configuration Resolution Order
+
+{noformat:title=Config Resolution Precedence}
+Priority (highest wins):
+────────────────────────
+
+ 1. Environment Variables
+    ├── GITHUB_TOKEN       → token (REQUIRED, never in config file)
+    ├── GITHUB_ORGS        → overrides github_organizations
+    ├── GITHUB_ENTERPRISES → overrides github_enterprises
+    ├── ELASTICSEARCH_URL  → overrides elasticsearch_url
+    ├── ES_API_KEY         → Elasticsearch API key
+    └── ES_INDEX           → overrides elasticsearch_index
+
+ 2. config.json (plural keys)
+    ├── github_organizations: ["org-1", "org-2"]
+    └── github_enterprises:   ["ent-1"]
+
+ 3. config.json (legacy singular keys — backwards compatible)
+    ├── github_organization: "my-org"
+    └── github_enterprise:   "my-ent"
+{noformat}
+
+h2. 7.2 Full config.json Reference
+
+{code:language=javascript|title=config.json — annotated}
+{
+  "github_organizations": ["org-1", "org-2"],
+  "github_enterprises":   ["ent-1"],
+
+  "exclude_skus": [
+    "Copilot Business",
+    "Copilot Enterprise"
+  ],
+
+  "cache_ttl_seconds":    900,
+  "http_timeout_seconds": 30,
+  "exporter_port":        9185,
+  "exporter_host":        "0.0.0.0",
+  "months_back":          11,
+  "log_level":            "INFO",
+  "api_version":          "2022-11-28",
+  "api_base":             "https://api.github.com",
+
+  "elasticsearch_url":    "",
+  "elasticsearch_index":  "ds-copilot-billing"
+}
+{code}
+
+||Key||Default||Description||
+|{{github_organizations}}|{{[]}}|GitHub org slugs to monitor|
+|{{github_enterprises}}|{{[]}}|GitHub enterprise slugs to monitor|
+|{{exclude_skus}}|{{"Copilot Business", "Copilot Enterprise"}}|SKUs to drop from general endpoint (seat licenses)|
+|{{cache_ttl_seconds}}|{{900}}|Cache lifetime in seconds (15 min)|
+|{{http_timeout_seconds}}|{{30}}|Per-request HTTP timeout|
+|{{exporter_port}}|{{9185}}|Metrics HTTP port|
+|{{exporter_host}}|{{0.0.0.0}}|Listen address|
+|{{months_back}}|{{11}}|How many previous months to fetch (0 = current only)|
+|{{log_level}}|{{INFO}}|Python logging level (DEBUG, INFO, WARNING, ERROR)|
+|{{api_version}}|{{2022-11-28}}|GitHub API version header|
+|{{elasticsearch_url}}|_(empty)_|ES cluster URL|
+|{{elasticsearch_index}}|{{ds-copilot-billing}}|Target ES index name|
+
+h2. 7.3 Required GitHub Token Permissions
+
+||Token Type||Required Scope||
+|Classic PAT|{{manage_billing:enterprise}}|
+|Fine-grained PAT|{{Billing:Read}} (organization or enterprise level)|
+
+----
+
+h1. 8. Deployment
+
+h2. 8.1 Deployment Architecture (Kubernetes / Flux)
+
+{noformat:title=Kubernetes Deployment Architecture}
+┌─ Kubernetes Cluster ──────────────────────────────────────────────────┐
+│                                                                       │
+│  ┌─ Namespace: monitoring ─────────────────────────────────────────┐  │
+│  │                                                                 │  │
+│  │  ┌─ Deployment ──────────────────────────────────────────────┐  │  │
+│  │  │  copilot-premium-exporter                                 │  │  │
+│  │  │                                                           │  │  │
+│  │  │  ┌─ Pod ────────────────────────────────────────────────┐  │  │  │
+│  │  │  │  securityContext:                                    │  │  │  │
+│  │  │  │    runAsNonRoot: true                                │  │  │  │
+│  │  │  │    runAsUser: 1000                                   │  │  │  │
+│  │  │  │                                                      │  │  │  │
+│  │  │  │  ┌─ Container: exporter ──────────────────────────┐  │  │  │  │
+│  │  │  │  │  python:3.12-slim                              │  │  │  │  │
+│  │  │  │  │  Port: 9185                                    │  │  │  │  │
+│  │  │  │  │                                                │  │  │  │  │
+│  │  │  │  │  Env:                                          │  │  │  │  │
+│  │  │  │  │    GITHUB_TOKEN ← Secret (github-token)        │  │  │  │  │
+│  │  │  │  │    ES_API_KEY   ← Secret (elk-apikey)          │  │  │  │  │
+│  │  │  │  │                                                │  │  │  │  │
+│  │  │  │  │  Volume: /app/config.json ← ConfigMap          │  │  │  │  │
+│  │  │  │  │                                                │  │  │  │  │
+│  │  │  │  │  Probes:                                       │  │  │  │  │
+│  │  │  │  │    liveness:  GET /metrics (30s interval)      │  │  │  │  │
+│  │  │  │  │    readiness: GET /metrics (10s interval)      │  │  │  │  │
+│  │  │  │  └────────────────────────────────────────────────┘  │  │  │  │
+│  │  │  └──────────────────────────────────────────────────────┘  │  │  │
+│  │  └───────────────────────────────────────────────────────────┘  │  │
+│  │                                                                 │  │
+│  │  ┌─ Service (ClusterIP) ──────────────┐                         │  │
+│  │  │  :9185 → pod:9185 (metrics)        │                         │  │
+│  │  └────────────────────────────────────┘                         │  │
+│  │                                                                 │  │
+│  │  ┌─ ServiceMonitor (optional) ────────┐                         │  │
+│  │  │  interval: 60s                     │                         │  │
+│  │  │  scrapeTimeout: 30s                │──→  Prometheus Operator │  │
+│  │  │  path: /metrics                    │                         │  │
+│  │  └────────────────────────────────────┘                         │  │
+│  │                                                                 │  │
+│  │  ┌─ ConfigMap: grafana-dashboard ─────┐                         │  │
+│  │  │  label: grafana_dashboard=1        │──→  Grafana sidecar     │  │
+│  │  │  annotation: grafana_folder=Copilot│     auto-discovery      │  │
+│  │  └────────────────────────────────────┘                         │  │
+│  │                                                                 │  │
+│  │  ┌─ ConfigMap: kibana-dashboard ──────┐                         │  │
+│  │  │  copilot-premium.ndjson            │──→  Kibana import       │  │
+│  │  └────────────────────────────────────┘                         │  │
+│  │                                                                 │  │
+│  └─────────────────────────────────────────────────────────────────┘  │
+│                                                                       │
+└───────────────────────────────────────────────────────────────────────┘
+{noformat}
+
+h2. 8.2 Helm Chart Structure
+
+{noformat:title=Helm Chart File Tree}
+helm/copilot-premium-exporter/
+├── Chart.yaml                       # v1.0.0, appVersion 2.0
+├── values.yaml                      # Default values
+├── values-local.yaml                # Local dev overrides
+├── dashboards/
+│   ├── copilot-premium.json         # Grafana dashboard JSON
+│   └── copilot-premium.ndjson       # Kibana dashboard NDJSON
+└── templates/
+    ├── _helpers.tpl                 # Template helpers (fullname, labels, selectors)
+    ├── deployment.yaml              # Pod spec with probes, secrets, configmap mount
+    ├── service.yaml                 # ClusterIP service on port 9185
+    ├── configmap.yaml               # config.json rendered from values
+    ├── secret.yaml                  # GITHUB_TOKEN (unless existingSecret)
+    ├── servicemonitor.yaml          # Prometheus Operator ServiceMonitor
+    ├── grafana-dashboard-cm.yaml    # Grafana sidecar auto-discovery ConfigMap
+    └── kibana-dashboard-cm.yaml     # Kibana dashboard ConfigMap
+{noformat}
+
+h2. 8.3 Docker Compose (Local Development)
+
+For local development and testing, a Docker Compose stack is provided:
+
+{code:language=bash|title=Quick Start}
+# Set your token
+export GITHUB_TOKEN="ghp_..."
+
+# Edit config.json with your org/enterprise slugs
+
+# Start the full stack
+docker compose up -d --build
+
+# Access:
+#   Exporter metrics: http://localhost:9185/metrics
+#   Prometheus:       http://localhost:9090
+#   Grafana:          http://localhost:3000 (admin/admin)
+{code}
+
+||Service||Image||Port||Purpose||
+|{{exporter}}|Built from Dockerfile|9185|The billing exporter|
+|{{prometheus}}|prom/prometheus:v2.53.0|9090|Scrapes exporter every 60s|
+|{{grafana}}|grafana/grafana:11.1.0|3000|Pre-provisioned dashboard + Prometheus datasource|
+
+----
+
+h1. 9. Grafana Dashboard
+
+The included Grafana dashboard provides comprehensive visibility into Copilot AI spend with *7 row sections* and *28 panels*:
+
+h2. Dashboard Variables (Filters)
+
+||Variable||Type||Description||
+|{{entity_type}}|Custom|Filter by {{enterprise}} or {{organization}}|
+|{{entity}}|Query|Filter by entity name (auto-populated from metrics)|
+|{{product}}|Query|Filter by product (e.g., Copilot)|
+
+h2. Dashboard Sections
+
+{noformat:title=Grafana Dashboard Layout}
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Copilot AI Credits Dashboard                     │
+│  Filters: [Entity Type ▾]  [Entity ▾]  [Product ▾]                 │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ROW 1: Overview & Budget                                           │
+│  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌──────────────┐ │
+│  │Net Spend│ │Gross    │ │Discount │ │Credits  │ │Budget        │ │
+│  │ (stat)  │ │Spend    │ │Savings  │ │Consumed │ │Utilization   │ │
+│  │         │ │(stat)   │ │(stat)   │ │(stat)   │ │(gauge)       │ │
+│  └─────────┘ └─────────┘ └─────────┘ └─────────┘ └──────────────┘ │
+│  ┌──────────────────────┐ ┌─────────────────────────────────────┐  │
+│  │Top Models by         │ │Net Spend Share by Model             │  │
+│  │Net Spend (bar gauge) │ │(pie chart)                          │  │
+│  └──────────────────────┘ └─────────────────────────────────────┘  │
+│                                                                     │
+│  ROW 2: Spend by Model                                              │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │ Net Spend by Model (time series)                                ││
+│  └─────────────────────────────────────────────────────────────────┘│
+│  ┌──────────────────────┐ ┌─────────────────────────────────────┐  │
+│  │Gross Spend Share     │ │Per-Model Cost & Usage Breakdown     │  │
+│  │(pie chart)           │ │(table)                              │  │
+│  └──────────────────────┘ └─────────────────────────────────────┘  │
+│                                                                     │
+│  ROW 3: Requests & Quantity by Model                                │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │ Net Requests by Model (time series)                             ││
+│  └─────────────────────────────────────────────────────────────────┘│
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │ Net Requests Share by Model (pie chart)                         ││
+│  └─────────────────────────────────────────────────────────────────┘│
+│                                                                     │
+│  ROW 4: Cost Efficiency by Model                                    │
+│  ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────────┐   │
+│  │Price/Unit  │ │Net Spend   │ │Discount $  │ │Discount Rate % │   │
+│  │by Model    │ │by Model    │ │by Model    │ │by Model        │   │
+│  │(bar chart) │ │(bar chart) │ │(bar chart) │ │(bar chart)     │   │
+│  └────────────┘ └────────────┘ └────────────┘ └────────────────┘   │
+│                                                                     │
+│  ROW 5: By SKU (model-agnostic fallback)                            │
+│  ┌─────────────────────────────────┐ ┌─────────────────────────┐   │
+│  │Net Spend by SKU (time series)   │ │Spend by SKU (table)     │   │
+│  └─────────────────────────────────┘ └─────────────────────────┘   │
+│                                                                     │
+│  ROW 6: Exporter Health                                             │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐              │
+│  │Scrape    │ │Last      │ │Scrape    │ │Scrape    │              │
+│  │Status    │ │Scrape Age│ │Duration  │ │Failures  │              │
+│  │(stat)    │ │(stat)    │ │p95 (stat)│ │1h (stat) │              │
+│  └──────────┘ └──────────┘ └──────────┘ └──────────┘              │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │ Scrape Duration p95 (time series)                               ││
+│  └─────────────────────────────────────────────────────────────────┘│
+│                                                                     │
+│  ROW 7: Month-over-Month Comparison                                 │
+│  ┌────────────────┐ ┌─────────────────┐ ┌──────────────────────┐   │
+│  │Net Spend       │ │AI Credits       │ │Monthly Summary       │   │
+│  │by Month (bar)  │ │by Month (bar)   │ │(table)               │   │
+│  └────────────────┘ └─────────────────┘ └──────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │ Net Spend by Model — Month Comparison (bar chart)               ││
+│  └─────────────────────────────────────────────────────────────────┘│
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+{noformat}
+
+----
+
+h1. 10. SKU Filtering & Seat License Exclusion
+
+The general {{/usage}} endpoint returns *all* billing items for a product, including seat-license subscriptions (e.g., "Copilot Business" at $19/seat/month). These are subscriptions, not AI usage, so they would inflate spend totals if included.
+
+{noformat:title=SKU Filtering Logic}
+General endpoint response items:
+  ┌──────────────────────────────────────────────────────────────┐
+  │  product: "Copilot"  sku: "Copilot Business"   ──→ EXCLUDED │  (seat license)
+  │  product: "Copilot"  sku: "Copilot Enterprise"  ──→ EXCLUDED │  (seat license)
+  │  product: "Copilot"  sku: "Copilot AI Credits"  ──→ INCLUDED │  (AI usage)
+  │  product: "Actions"  sku: "Actions Minutes"      ──→ EXCLUDED │  (wrong product)
+  └──────────────────────────────────────────────────────────────┘
+
+Filter rules applied to general endpoint only:
+  1. product must equal "Copilot" (case-insensitive)
+  2. sku must NOT be in exclude_skus set (case-insensitive)
+
+Default exclude_skus: {"copilot business", "copilot enterprise"}
+Configurable via config.json "exclude_skus" array.
+{noformat}
+
+----
+
+h1. 11. Caching Strategy
+
+{noformat:title=Cache Behavior Timeline}
+Time ──────────────────────────────────────────────────────────────────►
+
+  t=0          t=60s         t=120s        ...    t=900s       t=960s
+  │             │              │                    │             │
+  ▼             ▼              ▼                    ▼             ▼
+  FETCH         HIT            HIT           ...   FETCH         HIT
+  (API call)    (cached)       (cached)            (API call)    (cached)
+  cache.expires               cache still          cache.expires
+  = t+900s                    valid                = t+1800s
+  │                                                │
+  └─── ES bulk index                               └─── ES bulk index
+       (if enabled)                                     (if enabled)
+
+  Prometheus scrape interval = 60s
+  Cache TTL = 900s (15 min)
+
+  Result: ~1 real API fetch per 15 minutes, regardless of scrape frequency.
+  Thread safety: cache reads/writes protected by threading.Lock.
+{noformat}
+
+----
+
+h1. 12. Deduplication Logic
+
+Since all three endpoints are called and may return overlapping data (especially during billing model transitions), items are deduplicated before caching:
+
+{noformat:title=Deduplication Algorithm}
+Input: merged items from ai_credit + premium_request + general endpoints
+
+Step 1: Build composite key (all lowercase):
+  key = (model, sku, product, unitType, year, month)
+
+Step 2: For each item:
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Key NOT in bucket?  → Insert item as-is                        │
+  │                                                                  │
+  │  Key already in bucket?  → Merge:                                │
+  │    For each numeric field (grossQuantity, netQuantity,           │
+  │    discountQuantity, grossAmount, netAmount, discountAmount,     │
+  │    quantity):                                                     │
+  │      existing[field] = MAX(existing[field], new[field])          │
+  │                                                                  │
+  │    pricePerUnit → use the latest value (overwrite)               │
+  └──────────────────────────────────────────────────────────────────┘
+
+Why MAX instead of SUM?
+  Overlapping items from different endpoints represent the SAME usage
+  reported through different API surfaces, not additive usage. Taking
+  the MAX ensures we get the most complete value without double-counting.
+{noformat}
+
+----
+
+h1. 13. Docker Image
+
+Multi-stage build for minimal image size:
+
+{noformat:title=Dockerfile Stages}
+Stage 1: builder (python:3.12-slim)
+  └── pip install dependencies into /install prefix
+
+Stage 2: runtime (python:3.12-slim)
+  ├── Copy /install from builder (dependencies only)
+  ├── Copy copilot_premium_exporter.py + config.json
+  ├── Create non-root user "exporter" (UID 1000)
+  ├── EXPOSE 9185
+  └── ENTRYPOINT: python copilot_premium_exporter.py
+
+Security:
+  • Runs as non-root user
+  • No cache in final image (--no-cache-dir)
+  • Minimal attack surface (slim base)
+{noformat}
+
+----
+
+h1. 14. Sequence Diagram: Full Scrape Cycle
+
+{noformat:title=End-to-End Scrape Sequence}
+ Prometheus          Exporter              GitHub API           Elasticsearch
+     │                  │                      │                      │
+     │  GET /metrics    │                      │                      │
+     │─────────────────►│                      │                      │
+     │                  │                      │                      │
+     │                  │  cache expired?       │                      │
+     │                  │──┐                   │                      │
+     │                  │  │ YES               │                      │
+     │                  │◄─┘                   │                      │
+     │                  │                      │                      │
+     │                  │  For each entity:     │                      │
+     │                  │  For each month:      │                      │
+     │                  │                      │                      │
+     │                  │  GET ai_credit/usage │                      │
+     │                  │─────────────────────►│                      │
+     │                  │     200 + items      │                      │
+     │                  │◄─────────────────────│                      │
+     │                  │                      │                      │
+     │                  │  GET premium_req/usage│                      │
+     │                  │─────────────────────►│                      │
+     │                  │     200 + items      │                      │
+     │                  │◄─────────────────────│                      │
+     │                  │                      │                      │
+     │                  │  GET usage           │                      │
+     │                  │─────────────────────►│                      │
+     │                  │     200 + items      │                      │
+     │                  │◄─────────────────────│                      │
+     │                  │                      │                      │
+     │                  │  tag + deduplicate    │                      │
+     │                  │──┐                   │                      │
+     │                  │◄─┘                   │                      │
+     │                  │                      │                      │
+     │                  │  store in cache       │                      │
+     │                  │──┐                   │                      │
+     │                  │◄─┘                   │                      │
+     │                  │                      │                      │
+     │                  │  (if ES enabled)      │                      │
+     │                  │  bulk index ─────────────────────────────────►
+     │                  │                      │         (best-effort) │
+     │                  │                      │              ack/fail │
+     │                  │◄─────────────────────────────────────────────│
+     │                  │                      │                      │
+     │                  │  build GaugeMetric   │                      │
+     │                  │  Families            │                      │
+     │                  │──┐                   │                      │
+     │                  │◄─┘                   │                      │
+     │                  │                      │                      │
+     │  metrics payload │                      │                      │
+     │◄─────────────────│                      │                      │
+     │                  │                      │                      │
+
+ ─── Cache Hit Path (subsequent scrapes within TTL) ───
+
+ Prometheus          Exporter
+     │                  │
+     │  GET /metrics    │
+     │─────────────────►│
+     │                  │  cache valid?
+     │                  │──┐
+     │                  │  │ YES (no API calls)
+     │                  │◄─┘
+     │  metrics payload │
+     │◄─────────────────│
+{noformat}
+
+----
+
+h1. 15. Testing
+
+Tests are in {{test_copilot_premium_exporter.py}} using {{pytest}} + {{responses}} library for HTTP mocking.
+
+{code:language=bash|title=Running Tests}
+pip install -r requirements-dev.txt
+pytest test_copilot_premium_exporter.py -v
+{code}
+
+h2. Test Coverage
+
+||Test Class||What It Validates||
+|{{TestConstructor}}|Config wiring, session headers (Bearer token, Accept, API version)|
+|{{TestLoadConfig}}|Config loading from file + env vars, singular/plural keys, missing token/entity exits|
+|{{TestEndpointPriority}}|All three endpoints called; deduplication; 404 fallback behavior|
+|{{TestCollectWithData}}|Label values, all 7 metric values, scrape success flag|
+|{{TestCacheTTL}}|Cache hit (no extra API calls), cache expiry (new API calls)|
+|{{TestAuthFailure}}|401 on all endpoints -> scrape_success=0, failure counter increments|
+|{{TestEmptyUsageItems}}|Empty response -> 0 metrics but scrape_success=1|
+|{{TestMultiMonth}}|Multi-month fetch with correct year/month labels, year wrap (Jan->Dec)|
+|{{TestElasticsearchSender}}|Doc structure, bulk call, empty no-op, ES failure doesn't break collect|
+|{{TestElasticsearchConfig}}|ES enable/disable logic, config loading with/without API key|
+|{{TestExcludeSkus}}|Seat licenses excluded, AI credits included from general endpoint|
+
+----
+
+h1. 16. Dependencies
+
+||Package||Version||Purpose||
+|{{prometheus-client}}|>=0.20|Prometheus metrics exposition|
+|{{requests}}|>=2.32|HTTP client for GitHub API|
+|{{elasticsearch}}|>=8.0|Elasticsearch Python client (bulk indexing)|
+|{{pytest}}|>=8.0|Test framework (dev only)|
+|{{responses}}|>=0.25|HTTP mocking for tests (dev only)|
+
+Python runtime: *3.12* (slim Docker image)
+
+----
+
+h1. 17. Troubleshooting
+
+||Symptom||Likely Cause||Resolution||
+|{{scrape_success=0}}|All API calls failed (auth, network, or wrong entity slugs)|Check logs for 401/403/404. Verify token permissions and org/enterprise slugs.|
+|No metrics for some models|Entity not yet on Enhanced Billing Platform, or billing model transition|Ensure the org/enterprise is enrolled in GitHub's Enhanced Billing. Check all three endpoint logs.|
+|Seat license costs appearing|{{exclude_skus}} not configured or custom SKU names|Add the SKU names to {{exclude_skus}} in config.json (case-insensitive).|
+|High scrape duration|Many entities x many months = many API calls|Reduce {{months_back}}, increase {{cache_ttl_seconds}}, or reduce entity count.|
+|ES indexing failures|Wrong URL, expired API key, index permission|Check {{ELASTICSEARCH_URL}} and {{ES_API_KEY}}. Verify index write permissions. Failures don't affect Prometheus metrics.|
+|Rate limiting (429)|Too many API calls to GitHub|Increase {{cache_ttl_seconds}} to reduce call frequency. The exporter logs the rate limit reset timestamp.|
+
+----
+
+{info:title=Page Info}
+*Last updated:* July 2026 | *Maintainer:* Platform Engineering | *Source:* {{github_ai_usage}} repository
+{info}
